@@ -6,7 +6,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/ledgerline-fx ./cmd/ledgerline-fx
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.20
+RUN adduser -D -u 10001 ledgerline
+USER ledgerline
 COPY --from=build /out/ledgerline-fx /ledgerline-fx
 COPY rates_seed.json /rates_seed.json
 ENTRYPOINT ["/ledgerline-fx", "-seed-file", "/rates_seed.json"]
