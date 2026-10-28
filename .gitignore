@@ -1,4 +1,4 @@
 /data/
 *.bolt
-ledgerd
+/ledgerd
 /bin/
