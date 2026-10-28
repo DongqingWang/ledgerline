@@ -1,0 +1,71 @@
+# Field-level data classification and redaction policy for the
+# ledgerline-ai-gateway MCP tools.
+#
+# This file is the single source of truth for which ledger fields are safe
+# to hand to an AI agent as-is ("public"), and which are internal
+# operational metadata that should not be exposed by default
+# ("internal_sensitive"). internal_ai_gateway/redact reads this file at
+# startup; changing redaction behavior is a config change here, not a code
+# change in internal/redact.
+#
+# classification: one of
+#   - public             : returned to the caller unchanged.
+#   - internal_sensitive : subject to the "action" below.
+#
+# action: one of
+#   - none   : pass the value through unchanged (used for "public" fields).
+#   - redact : omit the field from the response entirely.
+#   - mask   : keep a short prefix/suffix of the value visible
+#              (e.g. "txn-...3f9a"), hiding the rest.
+#
+# If "action" is omitted, internal_sensitive defaults to "redact" and
+# public defaults to "none".
+
+fields:
+  # --- journal_entries ------------------------------------------------
+  cost_center:
+    # Internal cost-allocation metadata (which business unit a leg of a
+    # transfer is charged against). Not something an AI agent needs to
+    # answer "what's my balance" / "show me this transfer" style
+    # questions, and it can leak internal org structure, so it is
+    # redacted (omitted) from every tool response by default.
+    classification: internal_sensitive
+    action: redact
+
+  transfer_dedup_id:
+    # The idempotency key for a transfer. A single, narrow
+    # get_journal_entry lookup is allowed to echo it back in full (the
+    # caller already supplied it as input), but a broader
+    # search_transactions scan masks it, since bulk exposure of dedup
+    # keys is a stricter-scoped query and gets stricter redaction.
+    classification: internal_sensitive
+    action: mask
+
+  account_id:
+    classification: public
+    action: none
+
+  direction:
+    classification: public
+    action: none
+
+  amount_minor:
+    classification: public
+    action: none
+
+  currency:
+    classification: public
+    action: none
+
+  gl_account:
+    classification: public
+    action: none
+
+  posted_at:
+    classification: public
+    action: none
+
+  # --- account_balances ------------------------------------------------
+  balance_minor:
+    classification: public
+    action: none
