@@ -39,7 +39,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *httpAddr,
-		Handler: NewServer(cache),
+		Handler: withCORS(NewServer(cache)),
 	}
 
 	go func() {
@@ -53,6 +53,23 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http server error: %v", err)
 	}
+}
+
+// withCORS allows any origin to call this API. Fine for a local demo tool
+// (e.g. ledgerline-admin-console running on a different dev-server port) —
+// NOT appropriate for a public/production deployment, which would need a
+// real allowlist and auth instead of a permissive wildcard.
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 func splitAndTrim(s string) []string {
