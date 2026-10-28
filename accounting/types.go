@@ -21,13 +21,13 @@ const (
 // to ToAccount and a separate fee line, demonstrating that a single transfer
 // can still produce more than two journal lines while remaining balanced.
 type TransferContext struct {
-	FromAccount string
-	ToAccount   string
-	AmountMinor int64
-	FeeMinor    int64
-	Currency    string
-	Category    string // e.g. "seller_payout", "refund", "merchant_fee"
-	Country     string // e.g. "US", "DE" — "*" rules match any country
+	FromAccount string `json:"from_account"`
+	ToAccount   string `json:"to_account"`
+	AmountMinor int64  `json:"amount_minor"`
+	FeeMinor    int64  `json:"fee_minor,omitempty"`
+	Currency    string `json:"currency"`
+	Category    string `json:"category"` // e.g. "seller_payout", "refund", "merchant_fee"
+	Country     string `json:"country"`  // e.g. "US", "DE" — "*" rules match any country
 }
 
 // JournalLine is one leg of a double-entry journal entry.
