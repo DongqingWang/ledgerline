@@ -11,9 +11,8 @@ effect bolted onto one.
 > **Provenance**: this is an original implementation inspired by well-known,
 > publicly documented distributed-systems patterns (Raft consensus, event
 > sourcing, CQRS, double-entry bookkeeping) — it is not derived from, and
-> contains no code from, any proprietary system. See the top-level
-> [`ledgerline-docs`](../ledgerline-docs) repo for the full architecture
-> writeup.
+> contains no code from, any proprietary system. See the
+> [top-level README](../README.md) for the full architecture writeup.
 
 ## What it does
 

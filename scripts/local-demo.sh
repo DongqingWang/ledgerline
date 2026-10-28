@@ -8,10 +8,10 @@
 #   - Go toolchain installed
 #   - A local Postgres reachable at postgres://localhost:5432/ledgerline
 #     (create the DB first: `createdb ledgerline`)
-#   - All ledgerline-* repos checked out as siblings of this one
-#     (../ledgerline-raft, ../ledgerline-gateway, etc.)
+#   - Run from this monorepo, where each ledgerline-* service lives as a
+#     subdirectory of the repo root (./ledgerline-raft, ./ledgerline-gateway, etc.)
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=/tmp/ledgerline-local-demo
 rm -rf "$WORK" && mkdir -p "$WORK"
 PIDS=()

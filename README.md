@@ -12,24 +12,27 @@ this project, verified against a real, running stack at each step (not just
 unit-tested in isolation), and several real bugs found during that
 verification are documented below rather than swept under the rug.
 
-## Repos
+## Layout
 
-All repos are independent Go modules (or, for the admin console, a Vite/React
-app) checked out as siblings of this one:
+This is a monorepo: each service below is a subdirectory with its own
+`go.mod` (or, for the admin console, its own `package.json`) and its own
+README — independently buildable on its own, but versioned together here
+with its full original commit history preserved (each service started life
+as its own repo; see `git log -- <dir>` to see that history).
 
-| Repo | Role |
+| Directory | Role |
 |---|---|
-| [`ledgerline-raft`](../ledgerline-raft) | The core: a Raft-replicated, event-sourced ledger engine. Idempotent `AssertTransfer`, double-entry by construction, a committed-event stream for CQRS fan-out. |
-| [`ledgerline-accounting-core`](../ledgerline-accounting-core) | Double-entry journal composer + GL-dimension rule engine. Classifies a transfer's business context into GL account/cost center before it's submitted to the ledger. |
-| [`ledgerline-gateway`](../ledgerline-gateway) | Client-facing REST API. Leader discovery/retry into the raft cluster, composes journals via accounting-core first. |
-| [`ledgerline-balance-reader`](../ledgerline-balance-reader) | Fast CQRS read-path: tails the engine's event stream into an in-memory cache instead of querying the engine on every read. |
-| [`ledgerline-persistence-sync`](../ledgerline-persistence-sync) | Projects committed events into durable Postgres tables — the queryable system of record for reporting/reconciliation. |
-| [`ledgerline-fx`](../ledgerline-fx) | Independent FX rate service: static seed rates + optional live refresh, cross-rate derivation, conversion. |
-| [`ledgerline-orchestrator`](../ledgerline-orchestrator) | Demo shard-split controller: routing table + a (simplified) split operation that stands up a new cluster, replays history into it, and atomically swaps routing. |
-| [`ledgerline-reporting`](../ledgerline-reporting) | Trial Balance / reconciliation batch CLI reading the Postgres projection. Exits non-zero if debits ≠ credits. |
-| [`ledgerline-ai-gateway`](../ledgerline-ai-gateway) | An MCP server exposing read-only ledger-query tools to AI agents, with field-level redaction, a least-privilege DB role, and audit logging. |
-| [`ledgerline-admin-console`](../ledgerline-admin-console) | A small local demo web UI: balances, a transfer form, FX rates. |
-| `ledgerline-docs` (this repo) | This README, `docker-compose.yml`, and the demo scripts. |
+| [`ledgerline-raft`](./ledgerline-raft) | The core: a Raft-replicated, event-sourced ledger engine. Idempotent `AssertTransfer`, double-entry by construction, a committed-event stream for CQRS fan-out. |
+| [`ledgerline-accounting-core`](./ledgerline-accounting-core) | Double-entry journal composer + GL-dimension rule engine. Classifies a transfer's business context into GL account/cost center before it's submitted to the ledger. |
+| [`ledgerline-gateway`](./ledgerline-gateway) | Client-facing REST API. Leader discovery/retry into the raft cluster, composes journals via accounting-core first. |
+| [`ledgerline-balance-reader`](./ledgerline-balance-reader) | Fast CQRS read-path: tails the engine's event stream into an in-memory cache instead of querying the engine on every read. |
+| [`ledgerline-persistence-sync`](./ledgerline-persistence-sync) | Projects committed events into durable Postgres tables — the queryable system of record for reporting/reconciliation. |
+| [`ledgerline-fx`](./ledgerline-fx) | Independent FX rate service: static seed rates + optional live refresh, cross-rate derivation, conversion. |
+| [`ledgerline-orchestrator`](./ledgerline-orchestrator) | Demo shard-split controller: routing table + a (simplified) split operation that stands up a new cluster, replays history into it, and atomically swaps routing. |
+| [`ledgerline-reporting`](./ledgerline-reporting) | Trial Balance / reconciliation batch CLI reading the Postgres projection. Exits non-zero if debits ≠ credits. |
+| [`ledgerline-ai-gateway`](./ledgerline-ai-gateway) | An MCP server exposing read-only ledger-query tools to AI agents, with field-level redaction, a least-privilege DB role, and audit logging. |
+| [`ledgerline-admin-console`](./ledgerline-admin-console) | A small local demo web UI: balances, a transfer form, FX rates. |
+| *(repo root)* | This README, `docker-compose.yml`, and the demo scripts tying everything together. |
 
 ## Architecture
 

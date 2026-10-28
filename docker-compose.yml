@@ -1,9 +1,9 @@
 name: ledgerline
 
-# Brings up the full Ledgerline stack. Services are built from sibling repo
-# directories (../ledgerline-*), so this file only works if all repos are
-# checked out side-by-side under the same parent directory (the layout
-# `scripts/setup.sh`/the top-level README assumes).
+# Brings up the full Ledgerline stack. Services are built from subdirectories
+# of this repo (./ledgerline-*) -- each one is independently buildable on its
+# own too (see its own README), but this file assumes it's run from the
+# monorepo root where they all live side by side.
 #
 # Core services start automatically with `docker compose up`. `reporting`
 # and `ai-gateway` are one-shot/interactive tools, not steady-state daemons
@@ -11,13 +11,13 @@ name: ledgerline
 # them with `docker compose run --rm reporting` / `docker compose run --rm -i
 # ai-gateway` once the rest of the stack is up (see scripts/demo.sh).
 #
-# NOTE: this compose file has been authored carefully against every
-# service's real, verified CLI flags, but has NOT been exercised end-to-end
-# via `docker compose up` in the environment this project was built in
-# (Docker Desktop required interactive first-run setup that wasn't possible
-# there). The equivalent flow IS fully verified -- see scripts/demo.sh and
-# each repo's own README for the direct-binary verification that was
-# actually run. Please open an issue if you hit a snag running this.
+# Fully verified live: every container reports healthy, and a complete
+# end-to-end flow (fee-split transfer, idempotent duplicate detection,
+# fast-path vs. engine-path reads, a passing reconciliation from the
+# dockerized reporting CLI, and a genuine MCP protocol round-trip against
+# the dockerized ai-gateway with field redaction) has been run against this
+# exact compose file. See the top-level README's "Cross-cutting
+# observations" section for the real bugs found and fixed along the way.
 
 services:
   postgres:
@@ -40,7 +40,7 @@ services:
   # transport) since each runs in its own container network namespace; they
   # only collide if mapped to the same *host* port, which they aren't.
   raft-n1:
-    build: ../ledgerline-raft
+    build: ./ledgerline-raft
     command:
       [
         "-node-id", "n1",
@@ -64,7 +64,7 @@ services:
       retries: 20
 
   raft-n2:
-    build: ../ledgerline-raft
+    build: ./ledgerline-raft
     command:
       [
         "-node-id", "n2",
@@ -84,7 +84,7 @@ services:
       retries: 20
 
   raft-n3:
-    build: ../ledgerline-raft
+    build: ./ledgerline-raft
     command:
       [
         "-node-id", "n3",
@@ -104,7 +104,7 @@ services:
       retries: 20
 
   accountingsvc:
-    build: ../ledgerline-accounting-core
+    build: ./ledgerline-accounting-core
     command: ["-http-addr", "0.0.0.0:8090"]
     ports:
       - "18090:8090"
@@ -118,7 +118,7 @@ services:
   # browser-based admin-console (which bakes in http://localhost:8080 at
   # build time) works against this compose stack unmodified. ---
   gateway:
-    build: ../ledgerline-gateway
+    build: ./ledgerline-gateway
     command:
       [
         "-http-addr", "0.0.0.0:8080",
@@ -139,7 +139,7 @@ services:
       retries: 10
 
   balance-reader:
-    build: ../ledgerline-balance-reader
+    build: ./ledgerline-balance-reader
     command:
       [
         "-http-addr", "0.0.0.0:8280",
@@ -158,7 +158,7 @@ services:
       retries: 10
 
   persistence-sync:
-    build: ../ledgerline-persistence-sync
+    build: ./ledgerline-persistence-sync
     command:
       [
         "-postgres-url", "postgres://postgres@postgres:5432/ledgerline?sslmode=disable",
@@ -179,7 +179,7 @@ services:
       retries: 10
 
   fx:
-    build: ../ledgerline-fx
+    build: ./ledgerline-fx
     command: ["-http-addr", "0.0.0.0:8590"]
     ports:
       - "8590:8590"
@@ -190,7 +190,7 @@ services:
       retries: 10
 
   orchestrator:
-    build: ../ledgerline-orchestrator
+    build: ./ledgerline-orchestrator
     command:
       [
         "-http-addr", "0.0.0.0:8480",
@@ -209,7 +209,7 @@ services:
       retries: 10
 
   admin-console:
-    build: ../ledgerline-admin-console
+    build: ./ledgerline-admin-console
     ports:
       - "5180:80"
     depends_on:
@@ -220,7 +220,7 @@ services:
   # --- one-shot / interactive tools: not started by `docker compose up` ---
 
   reporting:
-    build: ../ledgerline-reporting
+    build: ./ledgerline-reporting
     command:
       [
         "-postgres-url", "postgres://postgres@postgres:5432/ledgerline?sslmode=disable",
@@ -231,7 +231,7 @@ services:
       postgres: { condition: service_healthy }
 
   ai-gateway:
-    build: ../ledgerline-ai-gateway
+    build: ./ledgerline-ai-gateway
     command:
       [
         "-postgres-url", "postgres://ledgerline_ai_readonly@postgres:5432/ledgerline?sslmode=disable",
