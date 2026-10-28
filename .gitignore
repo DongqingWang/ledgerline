@@ -1,0 +1,4 @@
+/data/
+*.bolt
+ledgerd
+/bin/
