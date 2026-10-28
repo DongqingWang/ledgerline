@@ -1,0 +1,5 @@
+/ledgerline-balance-reader
+/bin/
+*.test
+*.out
+.DS_Store
