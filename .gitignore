@@ -1,0 +1,14 @@
+# Build artifacts
+/bin/
+*.exe
+
+# Go
+*.test
+*.out
+
+# Local scratch / logs
+*.log
+*.jsonl
+
+# OS
+.DS_Store
