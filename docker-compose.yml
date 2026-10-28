@@ -1,0 +1,238 @@
+name: ledgerline
+
+# Brings up the full Ledgerline stack. Services are built from sibling repo
+# directories (../ledgerline-*), so this file only works if all repos are
+# checked out side-by-side under the same parent directory (the layout
+# `scripts/setup.sh`/the top-level README assumes).
+#
+# Core services start automatically with `docker compose up`. `reporting`
+# and `ai-gateway` are one-shot/interactive tools, not steady-state daemons
+# -- they're behind the "tools" profile so they don't start by default; run
+# them with `docker compose run --rm reporting` / `docker compose run --rm -i
+# ai-gateway` once the rest of the stack is up (see scripts/demo.sh).
+#
+# NOTE: this compose file has been authored carefully against every
+# service's real, verified CLI flags, but has NOT been exercised end-to-end
+# via `docker compose up` in the environment this project was built in
+# (Docker Desktop required interactive first-run setup that wasn't possible
+# there). The equivalent flow IS fully verified -- see scripts/demo.sh and
+# each repo's own README for the direct-binary verification that was
+# actually run. Please open an issue if you hit a snag running this.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ledgerline
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432" # host 5433, to avoid colliding with a local Postgres on 5432
+    volumes:
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ledgerline"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # --- ledgerline-raft: a 3-node cluster ---
+  # All three nodes share the same *internal* ports (8080 http, 7000 raft
+  # transport) since each runs in its own container network namespace; they
+  # only collide if mapped to the same *host* port, which they aren't.
+  raft-n1:
+    build: ../ledgerline-raft
+    command:
+      [
+        "-node-id", "n1",
+        "-raft-addr", "raft-n1:7000",
+        "-http-addr", "raft-n1:8080",
+        "-data-dir", "/data",
+        "-peers", "n1=raft-n1:7000=raft-n1:8080,n2=raft-n2:7000=raft-n2:8080,n3=raft-n3:7000=raft-n3:8080",
+        "-bootstrap=true",
+      ]
+    ports:
+      - "18081:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  raft-n2:
+    build: ../ledgerline-raft
+    command:
+      [
+        "-node-id", "n2",
+        "-raft-addr", "raft-n2:7000",
+        "-http-addr", "raft-n2:8080",
+        "-data-dir", "/data",
+        "-peers", "n1=raft-n1:7000=raft-n1:8080,n2=raft-n2:7000=raft-n2:8080,n3=raft-n3:7000=raft-n3:8080",
+      ]
+    ports:
+      - "18082:8080"
+    depends_on:
+      - raft-n1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  raft-n3:
+    build: ../ledgerline-raft
+    command:
+      [
+        "-node-id", "n3",
+        "-raft-addr", "raft-n3:7000",
+        "-http-addr", "raft-n3:8080",
+        "-data-dir", "/data",
+        "-peers", "n1=raft-n1:7000=raft-n1:8080,n2=raft-n2:7000=raft-n2:8080,n3=raft-n3:7000=raft-n3:8080",
+      ]
+    ports:
+      - "18083:8080"
+    depends_on:
+      - raft-n1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  accountingsvc:
+    build: ../ledgerline-accounting-core
+    command: ["-http-addr", "0.0.0.0:8090"]
+    ports:
+      - "18090:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # --- client-facing API: published on its OWN default port (8080) so the
+  # browser-based admin-console (which bakes in http://localhost:8080 at
+  # build time) works against this compose stack unmodified. ---
+  gateway:
+    build: ../ledgerline-gateway
+    command:
+      [
+        "-http-addr", "0.0.0.0:8080",
+        "-ledger-nodes", "raft-n1:8080,raft-n2:8080,raft-n3:8080",
+        "-accounting-addr", "http://accountingsvc:8090",
+      ]
+    ports:
+      - "8080:8080"
+    depends_on:
+      raft-n1: { condition: service_healthy }
+      raft-n2: { condition: service_healthy }
+      raft-n3: { condition: service_healthy }
+      accountingsvc: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  balance-reader:
+    build: ../ledgerline-balance-reader
+    command:
+      [
+        "-http-addr", "0.0.0.0:8280",
+        "-ledger-nodes", "raft-n1:8080,raft-n2:8080,raft-n3:8080",
+      ]
+    ports:
+      - "8280:8280"
+    depends_on:
+      raft-n1: { condition: service_healthy }
+      raft-n2: { condition: service_healthy }
+      raft-n3: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8280/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  persistence-sync:
+    build: ../ledgerline-persistence-sync
+    command:
+      [
+        "-postgres-url", "postgres://postgres@postgres:5432/ledgerline?sslmode=disable",
+        "-ledger-nodes", "raft-n1:8080,raft-n2:8080,raft-n3:8080",
+        "-http-addr", "0.0.0.0:8380",
+      ]
+    ports:
+      - "8380:8380"
+    depends_on:
+      postgres: { condition: service_healthy }
+      raft-n1: { condition: service_healthy }
+      raft-n2: { condition: service_healthy }
+      raft-n3: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8380/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  fx:
+    build: ../ledgerline-fx
+    command: ["-http-addr", "0.0.0.0:8590"]
+    ports:
+      - "8590:8590"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8590/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  orchestrator:
+    build: ../ledgerline-orchestrator
+    command:
+      [
+        "-http-addr", "0.0.0.0:8480",
+        "-initial-ledger-nodes", "raft-n1:8080,raft-n2:8080,raft-n3:8080",
+      ]
+    ports:
+      - "8480:8480"
+    depends_on:
+      raft-n1: { condition: service_healthy }
+      raft-n2: { condition: service_healthy }
+      raft-n3: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8480/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  admin-console:
+    build: ../ledgerline-admin-console
+    ports:
+      - "5180:80"
+    depends_on:
+      - gateway
+      - balance-reader
+      - fx
+
+  # --- one-shot / interactive tools: not started by `docker compose up` ---
+
+  reporting:
+    build: ../ledgerline-reporting
+    command:
+      [
+        "-postgres-url", "postgres://postgres@postgres:5432/ledgerline?sslmode=disable",
+        "-format", "table",
+      ]
+    profiles: ["tools"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  ai-gateway:
+    build: ../ledgerline-ai-gateway
+    command:
+      [
+        "-postgres-url", "postgres://ledgerline_ai_readonly@postgres:5432/ledgerline?sslmode=disable",
+      ]
+    profiles: ["tools"]
+    stdin_open: true
+    tty: true
+    depends_on:
+      postgres: { condition: service_healthy }
