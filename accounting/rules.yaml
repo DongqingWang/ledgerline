@@ -1,0 +1,48 @@
+# Example GL-dimension rule set. First matching rule wins; always keep a
+# final category: "*", country: "*" catch-all so every transfer resolves to
+# something (an "unclassified" bucket that should alert for manual review,
+# rather than a hard failure that blocks posting entirely).
+rules:
+  - match:
+      category: "seller_payout"
+      country: "US"
+    debit:
+      gl_account: "2100"
+      cost_center: "CC-PAYOUT-US"
+    credit:
+      gl_account: "4000"
+      cost_center: "CC-REVENUE-US"
+    fee_credit:
+      gl_account: "4900"
+      cost_center: "CC-FEES-US"
+
+  - match:
+      category: "seller_payout"
+    debit:
+      gl_account: "2100"
+      cost_center: "CC-PAYOUT-INTL"
+    credit:
+      gl_account: "4000"
+      cost_center: "CC-REVENUE-INTL"
+    fee_credit:
+      gl_account: "4900"
+      cost_center: "CC-FEES-INTL"
+
+  - match:
+      category: "refund"
+    debit:
+      gl_account: "4000"
+      cost_center: "CC-REVENUE"
+    credit:
+      gl_account: "2100"
+      cost_center: "CC-PAYOUT"
+
+  - match:
+      category: "*"
+      country: "*"
+    debit:
+      gl_account: "9999"
+      cost_center: "CC-UNCLASSIFIED"
+    credit:
+      gl_account: "9999"
+      cost_center: "CC-UNCLASSIFIED"
