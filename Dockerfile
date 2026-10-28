@@ -6,6 +6,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/gateway ./cmd/gateway
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.20
+RUN adduser -D -u 10001 ledgerline
+USER ledgerline
 COPY --from=build /out/gateway /gateway
 ENTRYPOINT ["/gateway"]
