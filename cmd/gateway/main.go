@@ -34,7 +34,24 @@ func main() {
 	server := gatewayapi.NewServer(ledger, accounting)
 
 	log.Printf("gateway: listening on %s (ledger nodes: %v, accounting: %s)", *httpAddr, nodes, *accountingAddr)
-	if err := http.ListenAndServe(*httpAddr, server.Routes()); err != nil {
+	if err := http.ListenAndServe(*httpAddr, withCORS(server.Routes())); err != nil {
 		log.Fatalf("gateway: server exited: %v", err)
 	}
+}
+
+// withCORS allows any origin to call this API. Fine for a local demo tool
+// (e.g. ledgerline-admin-console running on a different dev-server port) —
+// NOT appropriate for a public/production deployment, which would need a
+// real allowlist and auth instead of a permissive wildcard.
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
