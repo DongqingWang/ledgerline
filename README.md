@@ -84,27 +84,28 @@ concerns that can never compete with or block the operational write path.
 
 ## Running it
 
-**Docker (one command, if you have Docker running):**
+**Docker:**
 ```sh
 ./scripts/demo.sh
 ```
 Brings up the whole stack, runs an end-to-end demo (accounts, a fee-split
 transfer, idempotency check, fast-path vs. engine-path reads, trial balance,
 an MCP tool call), then tells you what to try next (the admin console is at
-http://localhost:5180). **Caveat**: this compose file was authored carefully
-against every service's real, verified CLI flags and passes `docker compose
-config` validation, but could not be exercised via a live `docker compose
-up` in the sandbox this project was built in (Docker Desktop needed
-interactive first-run setup unavailable there). If you hit a snag, please
-open an issue — and see the next option, which *was* fully verified live.
+http://localhost:5180). Fully verified live, including every container
+reporting `healthy`, a real transfer applying through gateway → raft →
+balance-reader/persistence-sync, the reporting CLI's reconciliation passing
+inside its own container, and a genuine MCP protocol round-trip against the
+dockerized `ai-gateway` showing `cost_center` correctly redacted.
 
-**Without Docker (fully verified, this is what was actually run during
-development):**
+**Without Docker:**
 ```sh
 ./scripts/local-demo.sh
 ```
 Builds and runs every service as a plain OS process against a local
-Postgres (`createdb ledgerline` first). Same end-to-end flow as above.
+Postgres (`createdb ledgerline` first). Same end-to-end flow, also fully
+verified live — this is the path used throughout most of this project's
+development, before Docker Desktop finished its (surprisingly slow,
+interactive-feeling) first-run initialization.
 
 ## Cross-cutting observations (and real bugs found along the way)
 
@@ -162,6 +163,21 @@ by: here's what actually went wrong while building it, not just what works.
   which replaces the subshell's process image with the binary instead of
   forking a child — so the tracked PID *is* the binary's PID. Confirmed fixed
   by checking `lsof` for leaked listeners after a run.
+
+- **A `localhost` healthcheck against a hostname-bound listener.** The raft
+  nodes bind their HTTP API to their own compose hostname (`raft-n1:8080`,
+  not `0.0.0.0:8080`) on purpose — that exact string is what gets embedded in
+  `-peers` and echoed back to callers as `leader_hint`, so it has to be
+  something other containers can actually dial. The first version of
+  `docker-compose.yml`'s healthcheck probed `http://localhost:8080/healthz`
+  from *inside* that same container — which doesn't work, because binding to
+  a specific hostname/interface in Go's `net.Listen` does not also bind the
+  loopback interface. All three raft containers came up `unhealthy` (even
+  though the application itself was working perfectly — raft leader election
+  and replication succeeded in the logs the whole time), which cascaded into
+  every dependent service refusing to start. Fixed by pointing each node's
+  healthcheck at its own hostname instead of `localhost`. Found by actually
+  running `docker compose up` and reading the failure, not by inspection.
 
 ## License
 

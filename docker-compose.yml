@@ -53,7 +53,12 @@ services:
     ports:
       - "18081:8080"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      # Binds to its own hostname (raft-n1:8080), not 0.0.0.0/localhost --
+      # that's required so the http-addr embedded in -peers (which other
+      # nodes echo back as leader_hint) is dialable from other containers.
+      # A side effect: "localhost" from *inside* this same container doesn't
+      # reach it, so the healthcheck must target the node's own hostname too.
+      test: ["CMD", "wget", "-qO-", "http://raft-n1:8080/healthz"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -73,7 +78,7 @@ services:
     depends_on:
       - raft-n1
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://raft-n2:8080/healthz"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -93,7 +98,7 @@ services:
     depends_on:
       - raft-n1
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://raft-n3:8080/healthz"]
       interval: 3s
       timeout: 3s
       retries: 20
