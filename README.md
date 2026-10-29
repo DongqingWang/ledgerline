@@ -38,7 +38,7 @@ as its own repo; see `git log -- <dir>` to see that history).
 
 ```mermaid
 flowchart TB
-    subgraph Write Path
+    subgraph write_path["Write Path"]
         GW["ledgerline-gateway<br/>(leader-follow retry)"]
         ACC["ledgerline-accounting-core<br/>(journal composition)"]
         RAFT["ledgerline-raft<br/>3-node cluster<br/>(event-sourced, Raft-replicated)"]
@@ -46,14 +46,14 @@ flowchart TB
         GW -->|AssertTransfer| RAFT
     end
 
-    subgraph Read Paths (CQRS fan-out from the committed event stream)
+    subgraph read_paths["Read Paths (CQRS fan-out from the committed event stream)"]
         BR["ledgerline-balance-reader<br/>(in-memory cache)"]
         PS["ledgerline-persistence-sync<br/>(durable Postgres projection)"]
         RAFT -->|event stream| BR
         RAFT -->|event stream| PS
     end
 
-    subgraph Downstream of Postgres
+    subgraph downstream_postgres["Downstream of Postgres"]
         RPT["ledgerline-reporting<br/>(trial balance + reconciliation)"]
         AI["ledgerline-ai-gateway<br/>(MCP, redacted, least-privilege)"]
         PG[(Postgres)]
