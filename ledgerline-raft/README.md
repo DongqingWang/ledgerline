@@ -36,8 +36,9 @@ effect bolted onto one.
 
 ## Why plain HTTP+JSON instead of gRPC
 
-The original design sketch called for gRPC, but this repo deliberately uses
-plain JSON-over-HTTP instead: it's exactly as easy to express the same
+gRPC would be the obvious first choice for this kind of inter-service
+traffic, but this repo deliberately uses plain JSON-over-HTTP instead: it's
+exactly as easy to express the same
 request/response contracts, and it means anyone cloning this repo can talk to
 it with nothing but `curl` — no protoc toolchain or generated stubs required.
 If you want a gRPC transport, the FSM/raft core here doesn't change at all;

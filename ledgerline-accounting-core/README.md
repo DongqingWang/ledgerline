@@ -1,13 +1,12 @@
 # ledgerline-accounting-core
 
 The double-entry bookkeeping and GL-dimension rule engine for
-[Ledgerline](https://github.com/ledgerline) — equivalent in role to
-`fascore` + `fasneuronsvc` in the original design: a pure business-logic
+[Ledgerline](https://github.com/ledgerline) — a pure business-logic
 library that every transfer must pass through *before* it's submitted to
 `ledgerline-raft`, because nothing should post to the ledger without first
 being correctly classified.
 
-> Original implementation modeling a well-known pattern (rule-driven GL
+> Original implementation of a well-known pattern (rule-driven GL
 > dimension derivation in double-entry accounting) — not derived from any
 > proprietary source.
 

@@ -1,9 +1,8 @@
 # ledgerline-admin-console
 
-A small, local-only demo web UI for [Ledgerline](https://github.com/ledgerline) — the
-"ConfigHub"/"fasconsole" equivalent in the original design: a way to see and
-interact with the running stack (balances, a transfer form, FX rates)
-without curling every endpoint by hand.
+A small, local-only demo web UI for [Ledgerline](https://github.com/ledgerline) — a way
+to see and interact with the running stack (balances, a transfer form, FX
+rates) without curling every endpoint by hand.
 
 > **No authentication, no production hardening.** This is explicitly a local
 > demo tool. Don't expose it publicly, and don't use the permissive CORS

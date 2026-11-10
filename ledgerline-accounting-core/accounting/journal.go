@@ -4,9 +4,8 @@ import "fmt"
 
 // ComposeJournal classifies a transfer via the rule set and builds a
 // balanced journal from it. This is the single choke point every transfer
-// must pass through before being submitted to the ledger engine — exactly
-// the role fasneuronsvc plays in the original design: nothing posts without
-// first being correctly classified.
+// must pass through before being submitted to the ledger engine: nothing
+// posts without first being correctly classified.
 func (rs *RuleSet) ComposeJournal(ctx TransferContext) (Journal, error) {
 	if ctx.AmountMinor <= 0 {
 		return Journal{}, fmt.Errorf("amount_minor must be positive")

@@ -1,10 +1,8 @@
 // Package ledgerclient is a small Go client for the ledgerline-raft HTTP
-// API. It implements the leader-discovery-and-retry pattern described in the
-// Ledgerline architecture docs: a client doesn't need to know which node is
-// currently the raft leader — it tries a candidate, and on a 409 "not
-// leader" response follows the returned leader_hint, up to a bounded number
-// of attempts (mirroring the "retry across up to 5 nodes" framing from the
-// original design).
+// API. It implements the leader-discovery-and-retry pattern: a client doesn't
+// need to know which node is currently the raft leader — it tries a
+// candidate, and on a 409 "not leader" response follows the returned
+// leader_hint, up to a bounded number of attempts.
 package ledgerclient
 
 import (

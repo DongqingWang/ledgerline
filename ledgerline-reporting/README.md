@@ -1,8 +1,7 @@
 # ledgerline-reporting
 
 A batch Trial Balance / reconciliation CLI for the [Ledgerline](https://github.com/ledgerline) distributed
-ledger platform. This is the "fasreportsvc" equivalent in Ledgerline's
-service topology: a standalone, offline reporting tool that reads the
+ledger platform: a standalone, offline reporting tool that reads the
 durable Postgres projection written by `ledgerline-persistence-sync` and
 produces the authoritative Trial Balance report, plus a global double-entry
 reconciliation check suitable for cron/CI gating.

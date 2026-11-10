@@ -1,9 +1,8 @@
 // Package accounting is the double-entry bookkeeping / GL-dimension rule
-// engine — the Ledgerline equivalent of fascore + fasneuronsvc. It sits in
-// the critical path of every transfer: given a transfer's business context,
-// it decides which GL account and cost center each leg of the journal
-// belongs to, and it is the single place that guarantees debits == credits
-// before anything is submitted to the ledger engine.
+// engine. It sits in the critical path of every transfer: given a transfer's
+// business context, it decides which GL account and cost center each leg of
+// the journal belongs to, and it is the single place that guarantees
+// debits == credits before anything is submitted to the ledger engine.
 package accounting
 
 // Direction is which side of a double-entry journal line a leg belongs to.

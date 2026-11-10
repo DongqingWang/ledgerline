@@ -1,13 +1,12 @@
 # ledgerline-orchestrator
 
-A demo shard-split controller for [Ledgerline](https://github.com/ledgerline), the
+A demo shard-split controller for [Ledgerline](https://github.com/ledgerline), an
 original, from-scratch distributed ledger platform (Raft consensus, event
-sourcing, CQRS, double-entry bookkeeping). This is the "fasorchestrator"
-equivalent in the Ledgerline design: it does not run consensus or store
-ledger state itself - it owns the **routing table** that tells the rest of
-the system which `ledgerline-raft` cluster currently owns which accounts,
-and it can perform a **shard split**: carve a sub-range of the key space
-off onto a brand-new cluster.
+sourcing, CQRS, double-entry bookkeeping). It does not run consensus or
+store ledger state itself - it owns the **routing table** that tells the
+rest of the system which `ledgerline-raft` cluster currently owns which
+accounts, and it can perform a **shard split**: carve a sub-range of the
+key space off onto a brand-new cluster.
 
 This repository has no Go module dependency on `ledgerline-raft` (no
 `replace` directive, no import of its packages). It talks to

@@ -43,11 +43,11 @@ type Rule struct {
 	FeeCredit Dimensions `yaml:"fee_credit,omitempty"`
 }
 
-// RuleSet is an ordered list of Rules — first match wins, same as the
-// condition-rule engines (e.g. fasneuronsvc) this is modeled on. Always
-// define a final catch-all rule (category: "*", country: "*") so every
-// transfer resolves to *something*, even if that something is an
-// "unclassified" GL bucket that flags for manual review.
+// RuleSet is an ordered list of Rules — first match wins, the usual
+// condition-rule-engine semantics. Always define a final catch-all rule
+// (category: "*", country: "*") so every transfer resolves to *something*,
+// even if that something is an "unclassified" GL bucket that flags for
+// manual review.
 type RuleSet struct {
 	Rules []Rule `yaml:"rules"`
 }

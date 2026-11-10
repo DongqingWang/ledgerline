@@ -19,8 +19,7 @@ import (
 )
 
 // MaxAttempts caps the number of nodes the client will try for a single
-// logical request, mirroring the "retry across up to 5 nodes" framing from
-// the original architecture.
+// logical request.
 const MaxAttempts = 5
 
 // Account mirrors ledgerline-raft's account JSON representation.
