@@ -35,6 +35,7 @@ type SplitResponse struct {
 	Reason            string `json:"reason,omitempty"`
 	MigratedAccounts  int    `json:"migrated_accounts"`
 	MigratedTransfers int    `json:"migrated_transfers"`
+	MigratedJournals  int    `json:"migrated_journals"`
 }
 
 // Orchestrator holds the live routing table and coordinates split
@@ -126,7 +127,7 @@ func (o *Orchestrator) Split(ctx context.Context, req SplitRequest) SplitRespons
 	plan := migrate.BuildPlan(events, inRange)
 
 	for _, skipped := range plan.SkippedCrossShard {
-		o.logf("WARN: skipping cross-shard transfer %s (from=%s to=%s): not supported by this demo split", skipped.DedupID, skipped.FromAccount, skipped.ToAccount)
+		o.logf("WARN: skipping cross-shard %s %s (from=%s to=%s, %d journal lines): not supported by this demo split", skipped.Kind, skipped.DedupID, skipped.FromAccount, skipped.ToAccount, len(skipped.Lines))
 	}
 
 	// Step (b, continued): find the new cluster's leader to write to.
@@ -136,41 +137,66 @@ func (o *Orchestrator) Split(ctx context.Context, req SplitRequest) SplitRespons
 	}
 
 	// Step (c): recreate accounts on the new cluster, preserving the
-	// unlimited flag read from the old cluster (the event stream does not
-	// carry it). We also remember each account's currency here: the
-	// transfer_applied event itself does not carry a currency field (see
-	// the wire contract), so we reuse the currency observed on the
-	// account when replaying transfers below.
-	accountCurrency := make(map[string]string, len(plan.Accounts))
+	// unlimited flag, account type, and tenant ownership read from the
+	// old cluster. Tenant is selected via X-Tenant-ID (admin key), since
+	// the engine assigns ownership server-side, never from the body.
+	accountTenant := make(map[string]string, len(plan.Accounts))
 	for _, accountID := range plan.Accounts {
 		acct, err := o.Client.GetAccount(ctx, oldLeaderAddr, accountID)
 		if err != nil {
 			return abort(fmt.Sprintf("failed to read account %s from old cluster: %v", accountID, err))
 		}
-		accountCurrency[accountID] = acct.Currency
-		_, err = o.Client.CreateAccount(ctx, newLeaderAddr, ledgerclient.CreateAccountRequest{
+		accountTenant[accountID] = acct.TenantID
+		_, err = o.Client.CreateAccount(ledgerclient.WithTenant(ctx, acct.TenantID), newLeaderAddr, ledgerclient.CreateAccountRequest{
 			AccountID: acct.AccountID,
 			Currency:  acct.Currency,
 			Unlimited: acct.Unlimited,
+			Type:      acct.Type,
 		})
 		if err != nil {
 			return abort(fmt.Sprintf("failed to create account %s on new cluster: %v", accountID, err))
 		}
 	}
 
-	// Step (d): replay same-shard transfers, in original order.
+	// Step (d): replay same-shard transfers (and posted holds, whose
+	// balance effect is an ordinary transfer), in original order.
 	for _, ev := range plan.Transfers {
-		_, err := o.Client.SubmitTransfer(ctx, newLeaderAddr, ledgerclient.TransferRequest{
+		tctx := ledgerclient.WithTenant(ctx, accountTenant[ev.FromAccount])
+		_, err := o.Client.SubmitTransfer(tctx, newLeaderAddr, ledgerclient.TransferRequest{
 			DedupID:     ev.DedupID,
 			FromAccount: ev.FromAccount,
 			ToAccount:   ev.ToAccount,
 			AmountMinor: ev.AmountMinor,
-			Currency:    accountCurrency[ev.FromAccount],
+			Currency:    ev.Currency,
 			GLAccount:   ev.GLAccount,
 			CostCenter:  ev.CostCenter,
 		})
 		if err != nil {
 			return abort(fmt.Sprintf("failed to replay transfer %s on new cluster: %v", ev.DedupID, err))
+		}
+	}
+
+	// Step (e): replay same-shard multi-leg journals (including reversal
+	// journals — their emitted lines are already the flipped legs, so
+	// replaying them as a journal reproduces the reversal's effect).
+	for _, ev := range plan.Journals {
+		lines := make([]ledgerclient.JournalLine, 0, len(ev.Lines))
+		for _, l := range ev.Lines {
+			lines = append(lines, ledgerclient.JournalLine{
+				AccountID:   l.AccountID,
+				Direction:   l.Direction,
+				AmountMinor: l.AmountMinor,
+				GLAccount:   l.GLAccount,
+				CostCenter:  l.CostCenter,
+			})
+		}
+		tctx := ledgerclient.WithTenant(ctx, accountTenant[ev.Lines[0].AccountID])
+		_, err := o.Client.SubmitJournal(tctx, newLeaderAddr, ledgerclient.JournalRequest{
+			DedupID: ev.DedupID,
+			Lines:   lines,
+		})
+		if err != nil {
+			return abort(fmt.Sprintf("failed to replay journal %s on new cluster: %v", ev.DedupID, err))
 		}
 	}
 
@@ -185,5 +211,6 @@ func (o *Orchestrator) Split(ctx context.Context, req SplitRequest) SplitRespons
 		Status:            "applied",
 		MigratedAccounts:  len(plan.Accounts),
 		MigratedTransfers: len(plan.Transfers),
+		MigratedJournals:  len(plan.Journals),
 	}
 }

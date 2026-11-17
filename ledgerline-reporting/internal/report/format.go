@@ -38,11 +38,12 @@ func Write(w io.Writer, format Format, balances []trialbalance.GLBalance) error 
 }
 
 func writeTable(w io.Writer, balances []trialbalance.GLBalance) error {
-	headers := []string{"GL ACCOUNT", "TOTAL DEBIT", "TOTAL CREDIT", "NET"}
+	headers := []string{"CURRENCY", "GL ACCOUNT", "TOTAL DEBIT", "TOTAL CREDIT", "NET"}
 
 	rows := make([][]string, 0, len(balances))
 	for _, b := range balances {
 		rows = append(rows, []string{
+			b.Currency,
 			b.GLAccount,
 			strconv.FormatInt(b.TotalDebitMinor, 10),
 			strconv.FormatInt(b.TotalCreditMinor, 10),
@@ -63,18 +64,19 @@ func writeTable(w io.Writer, balances []trialbalance.GLBalance) error {
 	}
 
 	printRow := func(cells []string) {
-		// Column 0 (GL account) is left-aligned; numeric columns are right-aligned.
-		fmt.Fprintf(w, "%-*s  %*s  %*s  %*s\n",
+		// Text columns left-aligned; numeric columns right-aligned.
+		fmt.Fprintf(w, "%-*s  %-*s  %*s  %*s  %*s\n",
 			widths[0], cells[0],
 			widths[1], cells[1],
 			widths[2], cells[2],
 			widths[3], cells[3],
+			widths[4], cells[4],
 		)
 	}
 
 	printRow(headers)
 
-	sepLen := widths[0] + widths[1] + widths[2] + widths[3] + 6
+	sepLen := widths[0] + widths[1] + widths[2] + widths[3] + widths[4] + 8
 	for i := 0; i < sepLen; i++ {
 		if _, err := io.WriteString(w, "-"); err != nil {
 			return err
@@ -97,11 +99,12 @@ func writeTable(w io.Writer, balances []trialbalance.GLBalance) error {
 
 func writeCSV(w io.Writer, balances []trialbalance.GLBalance) error {
 	cw := csv.NewWriter(w)
-	if err := cw.Write([]string{"gl_account", "total_debit_minor", "total_credit_minor", "net_minor"}); err != nil {
+	if err := cw.Write([]string{"currency", "gl_account", "total_debit_minor", "total_credit_minor", "net_minor"}); err != nil {
 		return err
 	}
 	for _, b := range balances {
 		record := []string{
+			b.Currency,
 			b.GLAccount,
 			strconv.FormatInt(b.TotalDebitMinor, 10),
 			strconv.FormatInt(b.TotalCreditMinor, 10),

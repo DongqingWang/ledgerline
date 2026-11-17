@@ -20,9 +20,17 @@ import (
 const maxAttempts = 5
 
 // Client talks to a ledgerline-raft cluster given the HTTP addresses of its
-// members. It does not need to know in advance which one is the leader.
+// members (each including scheme, e.g. "http://127.0.0.1:8001"). It does not
+// need to know in advance which one is the leader.
+//
+// APIKey/TenantID are optional: set them when the engine runs with
+// -auth-config. TenantID is only honored for admin keys (X-Tenant-ID).
 type Client struct {
-	httpClient *http.Client
+	httpClient   *http.Client
+	streamClient *http.Client // no timeout: event streams are long-lived
+
+	APIKey   string
+	TenantID string
 
 	mu          sync.Mutex
 	nodeAddrs   []string
@@ -31,8 +39,18 @@ type Client struct {
 
 func New(nodeAddrs []string) *Client {
 	return &Client{
-		httpClient: &http.Client{Timeout: 5 * time.Second},
-		nodeAddrs:  nodeAddrs,
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
+		streamClient: &http.Client{},
+		nodeAddrs:    nodeAddrs,
+	}
+}
+
+func (c *Client) setHeaders(req *http.Request) {
+	if c.APIKey != "" {
+		req.Header.Set("X-API-Key", c.APIKey)
+	}
+	if c.TenantID != "" {
+		req.Header.Set("X-Tenant-ID", c.TenantID)
 	}
 }
 
@@ -84,6 +102,56 @@ func (c *Client) AssertTransfer(ctx context.Context, req ledgertypes.TransferReq
 	return &out, nil
 }
 
+// AssertJournal submits an idempotent, atomic multi-leg journal. All legs
+// commit in one raft log entry or none do; debits must equal credits per
+// currency.
+func (c *Client) AssertJournal(ctx context.Context, req ledgertypes.JournalRequest) (*ledgertypes.TransferResult, error) {
+	var out ledgertypes.TransferResult
+	if err := c.writeRequest(ctx, "POST", "/v1/journals", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Reverse posts the exact opposite legs of a previously applied
+// transfer/journal as a new, linked journal. The original is never mutated.
+func (c *Client) Reverse(ctx context.Context, req ledgertypes.ReverseRequest) (*ledgertypes.TransferResult, error) {
+	var out ledgertypes.TransferResult
+	if err := c.writeRequest(ctx, "POST", "/v1/reversals", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreatePending places a two-phase hold against the sender's available
+// balance. Posted balances move only when the hold is posted.
+func (c *Client) CreatePending(ctx context.Context, req ledgertypes.PendingTransferRequest) (*ledgertypes.PendingTransfer, error) {
+	var out ledgertypes.PendingTransfer
+	if err := c.writeRequest(ctx, "POST", "/v1/pending-transfers", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PostPending commits a hold, moving posted balances. The action's DedupID
+// makes retries safe.
+func (c *Client) PostPending(ctx context.Context, pendingID string, req ledgertypes.PendingActionRequest) (*ledgertypes.TransferResult, error) {
+	var out ledgertypes.TransferResult
+	if err := c.writeRequest(ctx, "POST", "/v1/pending-transfers/"+pendingID+"/post", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// VoidPending releases a hold without moving posted balances.
+func (c *Client) VoidPending(ctx context.Context, pendingID string, req ledgertypes.PendingActionRequest) (*ledgertypes.TransferResult, error) {
+	var out ledgertypes.TransferResult
+	if err := c.writeRequest(ctx, "POST", "/v1/pending-transfers/"+pendingID+"/void", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // GetAccount reads account state from the first reachable node (not
 // necessarily the leader — see the server-side caveat about read
 // linearizability).
@@ -118,6 +186,7 @@ func (c *Client) writeRequest(ctx context.Context, method, path string, body, ou
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
+		c.setHeaders(req)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -130,24 +199,29 @@ func (c *Client) writeRequest(ctx context.Context, method, path string, body, ou
 			var eb ledgertypes.ErrorBody
 			_ = json.NewDecoder(resp.Body).Decode(&eb)
 			resp.Body.Close()
-			if eb.Error.Code == ledgertypes.ErrNotLeader && eb.Error.LeaderHint != "" {
-				c.rememberLeader(eb.Error.LeaderHint)
+			if eb.Error.Code == ledgertypes.ErrNotLeader {
+				if eb.Error.LeaderHint != "" {
+					c.rememberLeader(eb.Error.LeaderHint)
+				}
 				lastErr = fmt.Errorf("not leader, redirected to %s", eb.Error.LeaderHint)
 				continue
 			}
-			lastErr = fmt.Errorf("conflict: %s", eb.Error.Message)
-			continue
+			// Any other conflict (dedup parameter mismatch, account exists,
+			// already reversed) is terminal — retrying cannot change it.
+			return fmt.Errorf("%s: %s", eb.Error.Code, eb.Error.Message)
 		}
 
-		defer resp.Body.Close()
 		if resp.StatusCode >= 300 {
 			var eb ledgertypes.ErrorBody
 			_ = json.NewDecoder(resp.Body).Decode(&eb)
+			resp.Body.Close()
 			return fmt.Errorf("%s: %s", eb.Error.Code, eb.Error.Message)
 		}
 
 		c.rememberLeader(addr) // this node answered successfully as leader
-		return json.NewDecoder(resp.Body).Decode(out)
+		err = json.NewDecoder(resp.Body).Decode(out)
+		resp.Body.Close()
+		return err
 	}
 	return fmt.Errorf("giving up after %d attempts: %w", maxAttempts, lastErr)
 }
@@ -157,6 +231,7 @@ func (c *Client) getJSON(ctx context.Context, addr, path string, out interface{}
 	if err != nil {
 		return err
 	}
+	c.setHeaders(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -180,7 +255,8 @@ func (c *Client) StreamEvents(ctx context.Context, fromIndex uint64, handler fun
 		if err != nil {
 			return err
 		}
-		resp, err := c.httpClient.Do(req)
+		c.setHeaders(req)
+		resp, err := c.streamClient.Do(req)
 		if err != nil {
 			lastErr = err
 			continue

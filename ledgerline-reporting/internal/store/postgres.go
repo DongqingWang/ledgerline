@@ -18,6 +18,7 @@ import (
 // already normalized (NULL -> "").
 type JournalRow struct {
 	GLAccount   string
+	Currency    string
 	Direction   string
 	AmountMinor int64
 }
@@ -39,11 +40,11 @@ func Open(ctx context.Context, postgresURL string) (*sql.DB, error) {
 	return db, nil
 }
 
-// FetchJournalRows reads gl_account, direction, and amount_minor from
-// journal_entries, optionally filtered to posted_at within [from, to]
+// FetchJournalRows reads gl_account, currency, direction, and amount_minor
+// from journal_entries, optionally filtered to posted_at within [from, to]
 // (either bound may be the zero time.Time to mean "unbounded").
 func FetchJournalRows(ctx context.Context, db *sql.DB, from, to time.Time) ([]JournalRow, error) {
-	query := `SELECT gl_account, direction, amount_minor FROM journal_entries WHERE 1=1`
+	query := `SELECT gl_account, currency, direction, amount_minor FROM journal_entries WHERE 1=1`
 	args := make([]any, 0, 2)
 
 	if !from.IsZero() {
@@ -65,14 +66,16 @@ func FetchJournalRows(ctx context.Context, db *sql.DB, from, to time.Time) ([]Jo
 	for rows.Next() {
 		var (
 			glAccount sql.NullString
+			currency  string
 			direction string
 			amount    int64
 		)
-		if err := rows.Scan(&glAccount, &direction, &amount); err != nil {
+		if err := rows.Scan(&glAccount, &currency, &direction, &amount); err != nil {
 			return nil, fmt.Errorf("scanning journal_entries row: %w", err)
 		}
 		out = append(out, JournalRow{
 			GLAccount:   glAccount.String, // "" when NULL, which callers treat as UNSPECIFIED
+			Currency:    currency,
 			Direction:   direction,
 			AmountMinor: amount,
 		})

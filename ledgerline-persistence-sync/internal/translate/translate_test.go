@@ -48,6 +48,7 @@ func TestTransferToJournalRows(t *testing.T) {
 		FromAccount: "alice",
 		ToAccount:   "bob",
 		AmountMinor: 2500,
+		Currency:    "USD",
 		GLAccount:   "4000",
 		CostCenter:  "CC-1",
 	}
@@ -92,6 +93,7 @@ func TestTransferToJournalRows_OptionalFieldsAbsent(t *testing.T) {
 		FromAccount: "alice",
 		ToAccount:   "bob",
 		AmountMinor: 100,
+		Currency:    "USD",
 	}
 	debit, credit, err := TransferToJournalRows(ev)
 	if err != nil {

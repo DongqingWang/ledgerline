@@ -1,14 +1,20 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 )
 
 // Balance is the cached, read-optimized view of a single account's balance.
+// BalanceMinor is the posted balance; PendingMinor is the sum of active
+// two-phase holds; AvailableMinor = posted - pending is what new debits
+// may draw against (mirrors the engine's own semantics).
 type Balance struct {
-	AccountID    string `json:"account_id"`
-	Currency     string `json:"currency"`
-	BalanceMinor int64  `json:"balance_minor"`
+	AccountID      string `json:"account_id"`
+	Currency       string `json:"currency"`
+	BalanceMinor   int64  `json:"balance_minor"`
+	PendingMinor   int64  `json:"pending_minor"`
+	AvailableMinor int64  `json:"available_minor"`
 }
 
 // BalanceCache is an in-memory, mutex-guarded read model built by replaying
@@ -31,67 +37,92 @@ func NewBalanceCache() *BalanceCache {
 	}
 }
 
-// Apply applies a single LedgerEvent to the cache, mutating balances as
-// appropriate. It is idempotent/ordering-safe with respect to raft_index:
+// Apply applies a single LedgerEvent to the cache. It returns an error when
+// the event reveals a delivery GAP: the engine emits exactly one event per
+// raft log entry, so after the first event every subsequent index must be
+// exactly last+1. A gap means events were lost (e.g. an engine restarted
+// with an in-memory bus, or a bug) — applying later events on top of a
+// missing one would silently corrupt balances, so we refuse and let the
+// streamer reconnect / full-resync instead.
 //
-//   - Events are expected to arrive in strictly increasing raft_index order
-//     (that's what the stream guarantees). As a defensive measure against
-//     duplicate delivery or out-of-order replay (e.g. a reconnect that
-//     accidentally replays an already-seen index), any event whose
-//     RaftIndex is less than or equal to the last-processed index is
-//     ignored rather than re-applied. This prevents double-counting a
-//     transfer if the same index is ever seen twice.
-//   - account_created events insert a zero-balance entry for the account if
-//     one doesn't already exist. If the account somehow already exists
-//     (e.g. a duplicate account_created, which shouldn't happen in
-//     practice), the existing balance is left untouched -- we never reset
-//     a non-zero balance back to zero.
-//   - transfer_applied events debit from_account and credit to_account by
-//     amount_minor. Accounts are created on the fly with an empty currency
-//     if they are not already present in the cache, since this service is
-//     defensive about starting mid-stream or missing an account_created
-//     event; in normal operation every account is seen via
-//     account_created first because streaming starts at from_index=0.
-func (c *BalanceCache) Apply(ev LedgerEvent) {
+// Duplicate or stale indices (<= last processed) are ignored, which makes
+// reconnect-from-watermark replays safe.
+func (c *BalanceCache) Apply(ev LedgerEvent) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.haveProcessed && ev.RaftIndex <= c.lastProcessedIndex {
-		// Stale, duplicate, or out-of-order event relative to what we've
-		// already applied. Ignore it to avoid double-applying a transfer.
-		return
+	if c.haveProcessed {
+		if ev.RaftIndex <= c.lastProcessedIndex {
+			return nil // stale/duplicate replay
+		}
+		if ev.RaftIndex != c.lastProcessedIndex+1 {
+			return fmt.Errorf("event stream gap: last processed index %d, got %d", c.lastProcessedIndex, ev.RaftIndex)
+		}
+	}
+
+	// Expiries ride on the triggering entry; release them before the body.
+	for _, xp := range ev.ExpiredPendings {
+		c.getOrCreateLocked(xp.FromAccount, xp.Currency).PendingMinor -= xp.AmountMinor
 	}
 
 	switch ev.Kind {
 	case eventKindAccountCreated:
 		if _, exists := c.balances[ev.AccountID]; !exists {
-			c.balances[ev.AccountID] = &Balance{
-				AccountID:    ev.AccountID,
-				Currency:     ev.Currency,
-				BalanceMinor: 0,
-			}
+			c.balances[ev.AccountID] = &Balance{AccountID: ev.AccountID, Currency: ev.Currency}
 		}
 	case eventKindTransferApplied:
-		from := c.getOrCreateLocked(ev.FromAccount)
-		to := c.getOrCreateLocked(ev.ToAccount)
+		from := c.getOrCreateLocked(ev.FromAccount, ev.Currency)
+		to := c.getOrCreateLocked(ev.ToAccount, ev.Currency)
 		from.BalanceMinor -= ev.AmountMinor
 		to.BalanceMinor += ev.AmountMinor
+	case eventKindJournalApplied:
+		for _, ln := range ev.Lines {
+			b := c.getOrCreateLocked(ln.AccountID, ln.Currency)
+			if ln.Direction == "debit" {
+				b.BalanceMinor -= ln.AmountMinor
+			} else {
+				b.BalanceMinor += ln.AmountMinor
+			}
+		}
+	case eventKindPendingCreated:
+		c.getOrCreateLocked(ev.FromAccount, ev.Currency).PendingMinor += ev.AmountMinor
+	case eventKindPendingPosted:
+		from := c.getOrCreateLocked(ev.FromAccount, ev.Currency)
+		to := c.getOrCreateLocked(ev.ToAccount, ev.Currency)
+		from.PendingMinor -= ev.AmountMinor
+		from.BalanceMinor -= ev.AmountMinor
+		to.BalanceMinor += ev.AmountMinor
+	case eventKindPendingVoided:
+		c.getOrCreateLocked(ev.FromAccount, ev.Currency).PendingMinor -= ev.AmountMinor
+	case eventKindCommandRejected, eventKindCommandDuplicate:
+		// No balance effect; still advances the watermark so contiguity
+		// checking stays valid.
 	default:
-		// Unknown event kind: ignore. Forward-compatible with future event
-		// kinds this service doesn't yet understand.
+		return fmt.Errorf("unknown event kind %q at index %d", ev.Kind, ev.RaftIndex)
 	}
 
 	c.lastProcessedIndex = ev.RaftIndex
 	c.haveProcessed = true
+	return nil
+}
+
+// Reset wipes the cache and watermark so the streamer can full-resync from
+// index 0 after an unrecoverable gap.
+func (c *BalanceCache) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.balances = make(map[string]*Balance)
+	c.lastProcessedIndex = 0
+	c.haveProcessed = false
 }
 
 // getOrCreateLocked returns the Balance for accountID, creating a
-// zero-balance entry with an empty currency if it doesn't already exist.
-// Callers must hold c.mu for writing.
-func (c *BalanceCache) getOrCreateLocked(accountID string) *Balance {
+// zero-balance entry if it doesn't already exist. Callers must hold c.mu
+// for writing.
+func (c *BalanceCache) getOrCreateLocked(accountID, currency string) *Balance {
 	b, exists := c.balances[accountID]
 	if !exists {
-		b = &Balance{AccountID: accountID}
+		b = &Balance{AccountID: accountID, Currency: currency}
 		c.balances[accountID] = b
 	}
 	return b
@@ -106,7 +137,9 @@ func (c *BalanceCache) Get(accountID string) (Balance, bool) {
 	if !ok {
 		return Balance{}, false
 	}
-	return *b, true
+	out := *b
+	out.AvailableMinor = out.BalanceMinor - out.PendingMinor
+	return out, true
 }
 
 // All returns a snapshot copy of every cached balance.
@@ -115,7 +148,9 @@ func (c *BalanceCache) All() []Balance {
 	defer c.mu.RUnlock()
 	out := make([]Balance, 0, len(c.balances))
 	for _, b := range c.balances {
-		out = append(out, *b)
+		cp := *b
+		cp.AvailableMinor = cp.BalanceMinor - cp.PendingMinor
+		out = append(out, cp)
 	}
 	return out
 }

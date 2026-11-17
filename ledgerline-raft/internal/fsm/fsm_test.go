@@ -2,14 +2,27 @@ package fsm
 
 import (
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 
 	"github.com/ledgerline/ledgerline-raft/pkg/ledgertypes"
 )
 
+// testClock gives every test command a deterministic, monotonically
+// increasing timestamp, mirroring what the leader's HTTP layer stamps in
+// production. Index N gets base+N seconds.
+var testBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func testTime(index uint64) time.Time {
+	return testBase.Add(time.Duration(index) * time.Second)
+}
+
 func mustApply(t *testing.T, f *FSM, index uint64, cmd Command) *ApplyResult {
 	t.Helper()
+	if cmd.Timestamp.IsZero() {
+		cmd.Timestamp = testTime(index)
+	}
 	data, err := cmd.Encode()
 	if err != nil {
 		t.Fatalf("encode command: %v", err)
@@ -56,7 +69,7 @@ func fund(t *testing.T, f *FSM, index uint64, unlimitedSource, to string, amount
 }
 
 func TestCreateAccount(t *testing.T) {
-	f := New()
+	f := New("")
 
 	res := createAccount(t, f, 1, "acct-a", "USD")
 	if res.IsError() {
@@ -74,7 +87,7 @@ func TestCreateAccount(t *testing.T) {
 }
 
 func TestAssertTransfer_HappyPath(t *testing.T) {
-	f := New()
+	f := New("")
 	createUnlimitedAccount(t, f, 1, "external-deposit", "USD")
 	createAccount(t, f, 2, "alice", "USD")
 	createAccount(t, f, 3, "bob", "USD")
@@ -114,7 +127,7 @@ func TestAssertTransfer_HappyPath(t *testing.T) {
 }
 
 func TestAssertTransfer_IdempotentOnDedupID(t *testing.T) {
-	f := New()
+	f := New("")
 	createUnlimitedAccount(t, f, 1, "external-deposit", "USD")
 	createAccount(t, f, 2, "alice", "USD")
 	createAccount(t, f, 3, "bob", "USD")
@@ -151,7 +164,7 @@ func TestAssertTransfer_IdempotentOnDedupID(t *testing.T) {
 }
 
 func TestAssertTransfer_InsufficientFunds(t *testing.T) {
-	f := New()
+	f := New("")
 	createAccount(t, f, 1, "alice", "USD")
 	createAccount(t, f, 2, "bob", "USD")
 
@@ -168,7 +181,7 @@ func TestAssertTransfer_InsufficientFunds(t *testing.T) {
 }
 
 func TestAssertTransfer_UnlimitedAccountCanGoNegative(t *testing.T) {
-	f := New()
+	f := New("")
 	createUnlimitedAccount(t, f, 1, "external-deposit", "USD")
 	createAccount(t, f, 2, "alice", "USD")
 
@@ -190,7 +203,7 @@ func TestAssertTransfer_UnlimitedAccountCanGoNegative(t *testing.T) {
 }
 
 func TestAssertTransfer_AccountNotFound(t *testing.T) {
-	f := New()
+	f := New("")
 	createAccount(t, f, 1, "alice", "USD")
 
 	res := mustApply(t, f, 2, Command{
@@ -206,7 +219,7 @@ func TestAssertTransfer_AccountNotFound(t *testing.T) {
 }
 
 func TestSnapshotRestore_RoundTrip(t *testing.T) {
-	f := New()
+	f := New("")
 	createUnlimitedAccount(t, f, 1, "external-deposit", "USD")
 	createAccount(t, f, 2, "alice", "USD")
 	fund(t, f, 3, "external-deposit", "alice", 5_000)
@@ -221,7 +234,7 @@ func TestSnapshotRestore_RoundTrip(t *testing.T) {
 		t.Fatalf("persist: %v", err)
 	}
 
-	restored := New()
+	restored := New("")
 	if err := restored.Restore(sink.reader()); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -236,7 +249,7 @@ func TestSnapshotRestore_RoundTrip(t *testing.T) {
 }
 
 func TestEventBus_ReplayAndLive(t *testing.T) {
-	f := New()
+	f := New("")
 	createUnlimitedAccount(t, f, 1, "external-deposit", "USD")
 	createAccount(t, f, 2, "alice", "USD")
 	fund(t, f, 3, "external-deposit", "alice", 1_000)

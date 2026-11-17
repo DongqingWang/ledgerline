@@ -6,6 +6,8 @@ package translate
 
 import (
 	"errors"
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/ledgerline/ledgerline-persistence-sync/internal/events"
@@ -20,8 +22,12 @@ const (
 )
 
 // JournalEntryRow mirrors one row to be inserted into journal_entries.
+// LineIndex positions the leg within its journal (the uniqueness key is
+// (transfer_dedup_id, line_index), which supports multi-leg journals where
+// the same account can appear on several legs).
 type JournalEntryRow struct {
 	TransferDedupID string
+	LineIndex       int
 	AccountID       string
 	Direction       Direction
 	AmountMinor     int64
@@ -30,6 +36,7 @@ type JournalEntryRow struct {
 	CostCenter      *string
 	PostedAt        time.Time
 	RaftIndex       int64
+	ReversalOf      *string
 }
 
 // BalanceDelta describes a single account's balance mutation resulting from
@@ -41,11 +48,25 @@ type BalanceDelta struct {
 	RaftIndex  int64
 }
 
+// AccountDelta is the aggregated per-account effect of one event: posted
+// balance change and/or two-phase hold change. One event can touch an
+// account on several journal legs; the deltas are netted here so the store
+// applies exactly one guarded upsert per account.
+type AccountDelta struct {
+	AccountID    string
+	Currency     string
+	BalanceMinor int64
+	PendingMinor int64
+	RaftIndex    int64
+}
+
 // AccountBalanceSeed is the zero-balance row to upsert for a newly created
 // account.
 type AccountBalanceSeed struct {
 	AccountID string
 	Currency  string
+	Type      string
+	TenantID  string
 }
 
 var (
@@ -84,14 +105,22 @@ func AccountCreatedToSeed(ev events.LedgerEvent) (AccountBalanceSeed, error) {
 	return AccountBalanceSeed{
 		AccountID: ev.AccountID,
 		Currency:  ev.Currency,
+		Type:      ev.AccountType,
+		TenantID:  ev.TenantID,
 	}, nil
 }
 
 // TransferToJournalRows converts a transfer_applied LedgerEvent into the two
-// journal_entries rows (one debit, one credit) it produces.
+// journal_entries rows (one debit, one credit) it produces. The wire event
+// carries the currency; a missing currency is a contract violation and a
+// hard error (never a silent empty-string fallback, which would poison
+// per-currency reconciliation).
 func TransferToJournalRows(ev events.LedgerEvent) (debit, credit JournalEntryRow, err error) {
 	if ev.Kind != events.KindTransferApplied {
 		return JournalEntryRow{}, JournalEntryRow{}, ErrWrongKind
+	}
+	if ev.Currency == "" {
+		return JournalEntryRow{}, JournalEntryRow{}, fmt.Errorf("%w: transfer_applied dedup_id=%q", ErrMissingCurrency, ev.DedupID)
 	}
 	gl := nullableString(ev.GLAccount)
 	cc := nullableString(ev.CostCenter)
@@ -99,7 +128,7 @@ func TransferToJournalRows(ev events.LedgerEvent) (debit, credit JournalEntryRow
 	base := JournalEntryRow{
 		TransferDedupID: ev.DedupID,
 		AmountMinor:     ev.AmountMinor,
-		Currency:        currencyForTransfer(ev),
+		Currency:        ev.Currency,
 		GLAccount:       gl,
 		CostCenter:      cc,
 		PostedAt:        ev.Timestamp,
@@ -109,25 +138,115 @@ func TransferToJournalRows(ev events.LedgerEvent) (debit, credit JournalEntryRow
 	debit = base
 	debit.AccountID = ev.FromAccount
 	debit.Direction = Debit
+	debit.LineIndex = 0
 
 	credit = base
 	credit.AccountID = ev.ToAccount
 	credit.Direction = Credit
+	credit.LineIndex = 1
 
 	return debit, credit, nil
 }
 
-// currencyForTransfer isolates the (currently trivial) decision of which
-// currency to stamp on journal_entries rows for a transfer. The
-// transfer_applied event itself does not carry a currency field in the
-// documented contract (currency is a property of the accounts involved, not
-// the transfer), so callers that need the authoritative currency should look
-// it up from account_balances. Here we default to empty string, leaving it
-// to the caller (store layer) to fill in from the accounts table if a
-// stricter guarantee is needed. This keeps the pure translation function
-// honest about what the event itself actually carries.
-func currencyForTransfer(ev events.LedgerEvent) string {
-	return ""
+// JournalToRows converts a journal_applied LedgerEvent into one
+// journal_entries row per leg, preserving per-leg GL dimensions and
+// currencies, and linking reversals to the original journal id.
+func JournalToRows(ev events.LedgerEvent) ([]JournalEntryRow, error) {
+	if ev.Kind != events.KindJournalApplied {
+		return nil, ErrWrongKind
+	}
+	if len(ev.Lines) < 2 {
+		return nil, fmt.Errorf("translate: journal_applied dedup_id=%q has %d lines, want >= 2", ev.DedupID, len(ev.Lines))
+	}
+	var reversalOf *string
+	if ev.ReversalOf != "" {
+		reversalOf = s2ptr(ev.ReversalOf)
+	}
+	rows := make([]JournalEntryRow, 0, len(ev.Lines))
+	for i, ln := range ev.Lines {
+		if ln.Currency == "" {
+			return nil, fmt.Errorf("%w: journal_applied dedup_id=%q line %d", ErrMissingCurrency, ev.DedupID, i)
+		}
+		dir := Debit
+		if ln.Direction == "credit" {
+			dir = Credit
+		} else if ln.Direction != "debit" {
+			return nil, fmt.Errorf("translate: journal_applied dedup_id=%q line %d: invalid direction %q", ev.DedupID, i, ln.Direction)
+		}
+		rows = append(rows, JournalEntryRow{
+			TransferDedupID: ev.DedupID,
+			LineIndex:       i,
+			AccountID:       ln.AccountID,
+			Direction:       dir,
+			AmountMinor:     ln.AmountMinor,
+			Currency:        ln.Currency,
+			GLAccount:       nullableString(ln.GLAccount),
+			CostCenter:      nullableString(ln.CostCenter),
+			PostedAt:        ev.Timestamp,
+			RaftIndex:       ev.RaftIndex,
+			ReversalOf:      reversalOf,
+		})
+	}
+	return rows, nil
+}
+
+// EventToAccountDeltas nets every balance/hold effect of one event into a
+// single sorted slice of per-account deltas. Expired holds carried on the
+// event are released first, then the event body is applied. rejected /
+// duplicate / account_created events produce no deltas.
+func EventToAccountDeltas(ev events.LedgerEvent) ([]AccountDelta, error) {
+	agg := make(map[string]*AccountDelta)
+	add := func(accountID, currency string, balance, pending int64) {
+		d, ok := agg[accountID]
+		if !ok {
+			d = &AccountDelta{AccountID: accountID, Currency: currency, RaftIndex: ev.RaftIndex}
+			agg[accountID] = d
+		}
+		d.BalanceMinor += balance
+		d.PendingMinor += pending
+	}
+
+	for _, xp := range ev.ExpiredPendings {
+		add(xp.FromAccount, xp.Currency, 0, -xp.AmountMinor)
+	}
+
+	switch ev.Kind {
+	case events.KindTransferApplied:
+		if ev.Currency == "" {
+			return nil, fmt.Errorf("%w: transfer_applied dedup_id=%q", ErrMissingCurrency, ev.DedupID)
+		}
+		add(ev.FromAccount, ev.Currency, -ev.AmountMinor, 0)
+		add(ev.ToAccount, ev.Currency, ev.AmountMinor, 0)
+	case events.KindJournalApplied:
+		for i, ln := range ev.Lines {
+			if ln.Currency == "" {
+				return nil, fmt.Errorf("%w: journal_applied dedup_id=%q line %d", ErrMissingCurrency, ev.DedupID, i)
+			}
+			if ln.Direction == "debit" {
+				add(ln.AccountID, ln.Currency, -ln.AmountMinor, 0)
+			} else {
+				add(ln.AccountID, ln.Currency, ln.AmountMinor, 0)
+			}
+		}
+	case events.KindPendingCreated:
+		add(ev.FromAccount, ev.Currency, 0, ev.AmountMinor)
+	case events.KindPendingPosted:
+		add(ev.FromAccount, ev.Currency, -ev.AmountMinor, -ev.AmountMinor)
+		add(ev.ToAccount, ev.Currency, ev.AmountMinor, 0)
+	case events.KindPendingVoided:
+		add(ev.FromAccount, ev.Currency, 0, -ev.AmountMinor)
+	case events.KindAccountCreated, events.KindCommandRejected, events.KindCommandDuplicate:
+		// No balance/hold effect.
+	default:
+		return nil, fmt.Errorf("translate: unknown event kind %q at raft_index=%d", ev.Kind, ev.RaftIndex)
+	}
+
+	out := make([]AccountDelta, 0, len(agg))
+	for _, d := range agg {
+		out = append(out, *d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
+	return out, nil
 }
 
 // TransferToBalanceDeltas converts a transfer_applied LedgerEvent into the

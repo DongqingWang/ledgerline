@@ -1,6 +1,7 @@
 package ledgerclient
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -58,7 +59,7 @@ func TestTransfer_FollowsLeaderHint(t *testing.T) {
 	leaderAddr = addrOf(leader)
 
 	client := New([]string{addrOf(follower)})
-	result, err := client.Transfer(TransferRequest{
+	result, err := client.Transfer(context.Background(), TransferRequest{
 		DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD",
 	})
 	if err != nil {
@@ -98,7 +99,7 @@ func TestTransfer_RemembersLastKnownLeader(t *testing.T) {
 	client := New([]string{addrOf(follower)})
 
 	// First call: follower redirects to leader.
-	if _, err := client.Transfer(TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"}); err != nil {
+	if _, err := client.Transfer(context.Background(), TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"}); err != nil {
 		t.Fatalf("first call: unexpected error: %v", err)
 	}
 	if atomic.LoadInt32(&followerCalls) != 1 || atomic.LoadInt32(&leaderCalls) != 1 {
@@ -107,7 +108,7 @@ func TestTransfer_RemembersLastKnownLeader(t *testing.T) {
 
 	// Second call: should go straight to the remembered leader, never
 	// touching the follower again.
-	if _, err := client.Transfer(TransferRequest{DedupID: "txn-2", FromAccount: "a", ToAccount: "b", AmountMinor: 200, Currency: "USD"}); err != nil {
+	if _, err := client.Transfer(context.Background(), TransferRequest{DedupID: "txn-2", FromAccount: "a", ToAccount: "b", AmountMinor: 200, Currency: "USD"}); err != nil {
 		t.Fatalf("second call: unexpected error: %v", err)
 	}
 	if atomic.LoadInt32(&followerCalls) != 1 {
@@ -144,7 +145,7 @@ func TestTransfer_GivesUpAfterMaxAttempts(t *testing.T) {
 	}
 
 	client := New([]string{addrs[0]})
-	_, err := client.Transfer(TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"})
+	_, err := client.Transfer(context.Background(), TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"})
 	if err == nil {
 		t.Fatal("expected an error after exhausting max attempts, got nil")
 	}
@@ -174,7 +175,7 @@ func TestTransfer_TerminalApplicationError(t *testing.T) {
 	defer server.Close()
 
 	client := New([]string{addrOf(server)})
-	_, err := client.Transfer(TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"})
+	_, err := client.Transfer(context.Background(), TransferRequest{DedupID: "txn-1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"})
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -187,5 +188,61 @@ func TestTransfer_TerminalApplicationError(t *testing.T) {
 	}
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("expected exactly 1 call (no retry on terminal error), got %d", calls)
+	}
+}
+
+// TestJournal_SendsAuthHeaders verifies the service API key and the
+// per-request tenant (via WithTenant) are sent as X-API-Key / X-Tenant-ID.
+func TestJournal_SendsAuthHeaders(t *testing.T) {
+	var gotKey, gotTenant string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-API-Key")
+		gotTenant = r.Header.Get("X-Tenant-ID")
+		transferAppliedResponse(w, "jrn-1")
+	}))
+	defer server.Close()
+
+	client := New([]string{addrOf(server)})
+	client.APIKey = "sk-internal"
+	ctx := WithTenant(context.Background(), "acme")
+	if _, err := client.Journal(ctx, JournalRequest{
+		DedupID: "j-1",
+		Lines: []JournalLine{
+			{AccountID: "a", Direction: "debit", AmountMinor: 100},
+			{AccountID: "b", Direction: "credit", AmountMinor: 100},
+		},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotKey != "sk-internal" {
+		t.Errorf("X-API-Key = %q, want sk-internal", gotKey)
+	}
+	if gotTenant != "acme" {
+		t.Errorf("X-Tenant-ID = %q, want acme", gotTenant)
+	}
+}
+
+// TestJournal_NoTenantHeaderWithoutWithTenant verifies a plain context
+// sends no X-Tenant-ID (platform scope / auth-disabled default).
+func TestJournal_NoTenantHeaderWithoutWithTenant(t *testing.T) {
+	var hasTenant bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasTenant = r.Header["X-Tenant-Id"]
+		transferAppliedResponse(w, "jrn-1")
+	}))
+	defer server.Close()
+
+	client := New([]string{addrOf(server)})
+	if _, err := client.Journal(context.Background(), JournalRequest{
+		DedupID: "j-2",
+		Lines: []JournalLine{
+			{AccountID: "a", Direction: "debit", AmountMinor: 100},
+			{AccountID: "b", Direction: "credit", AmountMinor: 100},
+		},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hasTenant {
+		t.Error("expected no X-Tenant-ID header without WithTenant")
 	}
 }

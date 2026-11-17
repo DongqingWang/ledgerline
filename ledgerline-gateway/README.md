@@ -15,8 +15,11 @@ It also sits in front of `ledgerline-accounting-core`, a service that knows
 how to turn a business-level transfer ("pay seller-1 $100, platform keeps a
 $3 fee") into a balanced double-entry journal (debit/credit lines with GL
 accounts and cost centers). The gateway composes that journal first, then
-translates it into the one or two simple two-party transfers that
-`ledgerline-raft`'s engine actually understands, and submits those.
+posts it to `ledgerline-raft` as **one atomic multi-leg `AssertJournal`**:
+every leg — including the fee leg, each with its own GL code — commits in a
+single raft log entry or none do. Cross-currency requests (`to_currency`)
+are converted via `ledgerline-fx` and posted as a 4-leg journal through the
+platform's fx-position accounts.
 
 Both upstream services are treated as plain HTTP dependencies. This repo does
 **not** import `ledgerline-raft` or `ledgerline-accounting-core` as Go
@@ -43,7 +46,10 @@ Request:
 }
 ```
 
-`fee_minor` may be omitted (or `0`) for a fee-free transfer.
+`fee_minor` may be omitted (or `0`) for a fee-free transfer. Setting
+`to_currency` (different from `currency`) requests an FX conversion: the
+recipient is credited in `to_currency` at the rate returned by
+`ledgerline-fx`. Fees are not supported on cross-currency transfers (422).
 
 Response (`200`):
 
@@ -61,30 +67,45 @@ What happens under the hood:
    `POST /v1/journal/compose` with `{from_account, to_account, amount_minor,
    fee_minor, currency, category, country}`. If that call fails, the gateway
    returns `422 Unprocessable Entity` with the accounting error.
-2. It reads the returned journal's lines: the (single) `debit` line is the
-   primary leg; the `credit` line whose `account_id == to_account` is the net
-   leg; and, if `fee_minor > 0`, the `credit` line whose
-   `account_id == "platform-fee-revenue"` is the fee leg.
-3. It submits transfer(s) to the ledger cluster via its leader-follow client:
-   - **No fee** (`fee_minor == 0`): one `POST /v1/transfers` call using
-     `dedup_id` as-is and the debit leg's `gl_account`/`cost_center`.
-   - **With fee** (`fee_minor > 0`): **two** calls, because
-     `ledgerline-raft`'s engine only understands simple two-party transfers,
-     so the 3-line journal is split:
-     - `dedup_id + "-net"`: `from_account -> to_account` for
-       `amount_minor - fee_minor`, using the net-credit leg's
-       `gl_account`/`cost_center`.
-     - `dedup_id + "-fee"`: `from_account -> "platform-fee-revenue"` for
-       `fee_minor`, using the fee leg's `gl_account`/`cost_center`.
+2. **Same currency**: it maps the composed journal's lines verbatim onto one
+   `POST /v1/journals` (`AssertJournal`) request — same `dedup_id`, every
+   leg keeping its own `gl_account`/`cost_center`. The engine validates
+   per-currency debit=credit and every account's available balance before
+   mutating anything, so a fee-split payout is all-or-nothing. (The old
+   two-transfer `-net`/`-fee` mapping was not atomic and is gone.)
 
    **`platform-fee-revenue` must exist as a real account in the ledger
    cluster** (created the normal way, via `POST /v1/accounts` against the
    cluster) for fee transfers to succeed — the gateway does not create it
    for you.
-4. It returns the composed journal plus every ledger-engine result it got
-   back. `status` is `"duplicate"` if any underlying ledger call reports a
-   duplicate `dedup_id` (i.e. this exact transfer was already applied), so
-   retrying a `POST /v1/transfers` with the same `dedup_id` is safe.
+3. **Cross-currency** (`to_currency` set): it calls `ledgerline-fx`'s
+   `POST /v1/convert`, ensures the platform's `fx-position-<CCY>` accounts
+   exist (unlimited asset accounts, auto-created; tenant-prefixed
+   `<tenant>:fx-position-<CCY>` when auth is enabled), and posts one 4-leg
+   journal:
+
+   ```
+   debit  from            amount     (currency)
+   credit fx-position-A   amount     (currency)
+   debit  fx-position-B   converted  (to_currency)
+   credit to              converted  (to_currency)
+   ```
+
+   Each currency balances independently — the engine's per-currency
+   journal invariant. The response `journal` shows these actual posted legs.
+4. It returns the posted journal plus the single ledger-engine result.
+   `status` is `"duplicate"` if the engine reports a duplicate `dedup_id`
+   (this exact journal was already applied), so retrying a
+   `POST /v1/transfers` with the same `dedup_id` is safe. Reusing a
+   `dedup_id` with *different* parameters is a `409 Conflict`.
+
+### `POST /v1/reversals`
+
+Request: `{"dedup_id": "rev-1", "original_dedup_id": "txn-1"}`. Passed
+through to the engine's `POST /v1/reversals`: the exact opposite legs are
+posted as a new journal linked via `reversal_of` (the original entry's
+`dedup_id`); the original is never mutated. An entry can be reversed at
+most once (`409 already_reversed` on a second attempt).
 
 ### `GET /v1/accounts/{id}`
 
@@ -136,6 +157,20 @@ Flags:
 | `-http-addr`        | `127.0.0.1:8080`       | Address the gateway itself listens on.                    |
 | `-ledger-nodes`     | *(required)*           | Comma-separated `ledgerline-raft` node HTTP addresses.     |
 | `-accounting-addr`  | `http://127.0.0.1:8090`| Base URL of the `ledgerline-accounting-core` REST service. |
+| `-fx-addr`          | *(empty = FX disabled)*| Base URL of `ledgerline-fx`; required for `to_currency` transfers. |
+| `-auth-config`      | *(empty = auth off)*   | JSON API-key table for client auth (same format as the engine's). |
+| `-ledger-api-key`   | *(empty)*              | Engine **admin** service key, when the engine runs with `-auth-config`. The gateway forwards the authenticated tenant via `X-Tenant-ID`. |
+
+## Authentication and tenant isolation
+
+With `-auth-config`, every request (except `/healthz`) needs an API key
+(`X-API-Key` or `Authorization: Bearer`). The key table maps keys to
+tenants; admin keys may act on behalf of a tenant via `X-Tenant-ID`. The
+gateway then calls the engine with its own admin service key
+(`-ledger-api-key`) and the authenticated tenant's `X-Tenant-ID` — tenant
+identity is never taken from a request body, and the engine stamps
+ownership server-side. FX position accounts are tenant-prefixed so
+positions never commingle across tenants.
 
 ## Development
 
@@ -146,11 +181,13 @@ go test ./...
 gofmt -l .   # should print nothing
 ```
 
-Unit tests cover the journal-to-ledger-call translation logic
-(`internal/gatewayapi`, with stubbed accounting/ledger clients) and the
-leader-follow retry behavior (`internal/ledgerclient`, with `httptest`
-servers simulating `not_leader` redirects, a never-resolving redirect chain
-that must give up after 5 attempts, and the last-known-leader optimization).
+Unit tests cover the journal mapping (per-leg GL preserved, fee split as
+one atomic journal, insufficient-funds surfacing with no partial follow-up),
+the FX 4-leg mapping (position-account creation/reuse, tenant prefixing,
+fee rejection), and the leader-follow retry behavior
+(`internal/ledgerclient`, with `httptest` servers simulating `not_leader`
+redirects, a never-resolving redirect chain that must give up after 5
+attempts, the last-known-leader optimization, and auth-header forwarding).
 
 ## Known simplifications
 
@@ -161,11 +198,9 @@ that must give up after 5 attempts, and the last-known-leader optimization).
   a `422` rather than being retried internally. (The ledger-side calls *are*
   retried, since that's where leader elections create real, expected
   transient failures.)
-- If the accounting journal succeeds but the *second* ledger call (the fee
-  leg) fails after the first (net) one already applied, the gateway returns
-  an error without attempting to compensate/reverse the first leg. The first
-  leg is itself safely retryable (by `dedup_id + "-net"`) if the caller
-  retries the whole gateway request, but true all-or-nothing atomicity
-  across both ledger calls is out of scope for this service.
-- No authentication/authorization is implemented; this is a bare
-  demonstration gateway.
+- Cross-currency transfers don't support fees (`fee_minor > 0` with
+  `to_currency` → 422), and the FX rate is fetched at request time — no
+  rate-lock / quote expiry.
+- Auth is a demo-grade static key table, not a real identity provider; the
+  middleware + server-side tenant stamping are the enforcement points a
+  real IdP would plug into.

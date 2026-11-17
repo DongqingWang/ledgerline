@@ -90,6 +90,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	for _, r := range rows {
 		tbRows = append(tbRows, trialbalance.JournalRow{
 			GLAccount:   r.GLAccount,
+			Currency:    r.Currency,
 			Direction:   r.Direction,
 			AmountMinor: r.AmountMinor,
 		})
@@ -102,12 +103,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	ok, debits, credits := trialbalance.Reconcile(balances)
-	if ok {
-		fmt.Fprintln(stdout, "RECONCILIATION: PASS")
+	// The double-entry invariant is checked per currency: debits and
+	// credits in different currencies must never be summed together.
+	checks := trialbalance.ReconcileByCurrency(balances)
+	allOK := true
+	for _, c := range checks {
+		if c.OK {
+			fmt.Fprintf(stdout, "RECONCILIATION %s: PASS (debits=%d, credits=%d)\n", c.Currency, c.Debits, c.Credits)
+		} else {
+			allOK = false
+			fmt.Fprintf(stdout, "RECONCILIATION %s: FAIL (debits=%d, credits=%d, diff=%d)\n", c.Currency, c.Debits, c.Credits, c.Debits-c.Credits)
+		}
+	}
+	if len(checks) == 0 {
+		fmt.Fprintln(stdout, "RECONCILIATION: PASS (no journal entries in range)")
+	}
+	if allOK {
 		return 0
 	}
-
-	fmt.Fprintf(stdout, "RECONCILIATION: FAIL (debits=%d, credits=%d, diff=%d)\n", debits, credits, debits-credits)
 	return 1
 }

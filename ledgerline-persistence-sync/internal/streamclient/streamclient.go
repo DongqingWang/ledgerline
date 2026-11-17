@@ -30,6 +30,9 @@ type Client struct {
 	// node (leader or follower) can serve the event stream.
 	Candidates []string
 	HTTPClient *http.Client
+	// APIKey, when set, is sent as X-API-Key. The engine's event stream
+	// requires an admin key when it runs with -auth-config.
+	APIKey string
 }
 
 // New constructs a Client for the given candidate addresses.
@@ -89,6 +92,9 @@ func (c *Client) streamFrom(ctx context.Context, addr string, fromIndex int64, h
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
+	}
+	if c.APIKey != "" {
+		req.Header.Set("X-API-Key", c.APIKey)
 	}
 
 	resp, err := c.HTTPClient.Do(req)

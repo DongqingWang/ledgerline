@@ -112,3 +112,101 @@ func TestBuildPlanPreservesTransferOrder(t *testing.T) {
 		t.Errorf("transfer order = %v, want [second third]", gotOrder)
 	}
 }
+
+func TestBuildPlanJournalAllLegsInRangeIsReplayed(t *testing.T) {
+	events := []ledgerclient.Event{
+		{RaftIndex: 1, Kind: ledgerclient.EventKindAccountCreated, AccountID: "seller"},
+		{RaftIndex: 2, Kind: ledgerclient.EventKindAccountCreated, AccountID: "platform"},
+		{RaftIndex: 3, Kind: ledgerclient.EventKindAccountCreated, AccountID: "fee-revenue"},
+		{RaftIndex: 4, Kind: ledgerclient.EventKindJournalApplied, DedupID: "j1", Lines: []ledgerclient.EventJournalLine{
+			{AccountID: "platform", Direction: "debit", AmountMinor: 10000, Currency: "USD"},
+			{AccountID: "seller", Direction: "credit", AmountMinor: 9700, Currency: "USD"},
+			{AccountID: "fee-revenue", Direction: "credit", AmountMinor: 300, Currency: "USD"},
+		}},
+	}
+	plan := BuildPlan(events, inSet("seller", "platform", "fee-revenue"))
+	if len(plan.Journals) != 1 || plan.Journals[0].DedupID != "j1" {
+		t.Errorf("Journals = %+v, want one journal j1", plan.Journals)
+	}
+	if len(plan.SkippedCrossShard) != 0 {
+		t.Errorf("SkippedCrossShard = %+v, want none", plan.SkippedCrossShard)
+	}
+	if !reflect.DeepEqual(plan.Accounts, []string{"seller", "platform", "fee-revenue"}) {
+		t.Errorf("Accounts = %v, want all three in creation order", plan.Accounts)
+	}
+}
+
+func TestBuildPlanJournalPartialRangeIsSkipped(t *testing.T) {
+	events := []ledgerclient.Event{
+		{RaftIndex: 1, Kind: ledgerclient.EventKindJournalApplied, DedupID: "cross-j", Lines: []ledgerclient.EventJournalLine{
+			{AccountID: "alice", Direction: "debit", AmountMinor: 100, Currency: "USD"},
+			{AccountID: "dave", Direction: "credit", AmountMinor: 100, Currency: "USD"},
+		}},
+	}
+	plan := BuildPlan(events, inSet("alice"))
+	if len(plan.Journals) != 0 {
+		t.Errorf("Journals = %+v, want none (cross-shard journal must not be replayed)", plan.Journals)
+	}
+	if len(plan.SkippedCrossShard) != 1 || plan.SkippedCrossShard[0].DedupID != "cross-j" {
+		t.Errorf("SkippedCrossShard = %+v, want one entry cross-j", plan.SkippedCrossShard)
+	}
+	// Accounts appearing only in journal legs are still observed.
+	if !reflect.DeepEqual(plan.Accounts, []string{"alice"}) {
+		t.Errorf("Accounts = %v, want [alice]", plan.Accounts)
+	}
+}
+
+func TestBuildPlanPendingPostedReplayedAsTransfer(t *testing.T) {
+	events := []ledgerclient.Event{
+		{RaftIndex: 1, Kind: ledgerclient.EventKindAccountCreated, AccountID: "a"},
+		{RaftIndex: 2, Kind: ledgerclient.EventKindAccountCreated, AccountID: "b"},
+		{RaftIndex: 3, Kind: ledgerclient.EventKindPendingCreated, DedupID: "hold-1", PendingID: "pnd-3", FromAccount: "a", ToAccount: "b", AmountMinor: 500, Currency: "USD"},
+		{RaftIndex: 4, Kind: ledgerclient.EventKindPendingPosted, DedupID: "post-1", PendingID: "pnd-3", FromAccount: "a", ToAccount: "b", AmountMinor: 500, Currency: "USD"},
+	}
+	plan := BuildPlan(events, inSet("a", "b"))
+	if len(plan.Transfers) != 1 || plan.Transfers[0].DedupID != "post-1" {
+		t.Errorf("Transfers = %+v, want the posted hold replayed as transfer post-1", plan.Transfers)
+	}
+	if len(plan.SkippedCrossShard) != 0 {
+		t.Errorf("SkippedCrossShard = %+v, want none", plan.SkippedCrossShard)
+	}
+}
+
+func TestBuildPlanPendingCreatedVoidedAndNoOpKindsIgnored(t *testing.T) {
+	events := []ledgerclient.Event{
+		{RaftIndex: 1, Kind: ledgerclient.EventKindAccountCreated, AccountID: "a"},
+		{RaftIndex: 2, Kind: ledgerclient.EventKindAccountCreated, AccountID: "b"},
+		{RaftIndex: 3, Kind: ledgerclient.EventKindPendingCreated, DedupID: "hold-1", FromAccount: "a", ToAccount: "b", AmountMinor: 500},
+		{RaftIndex: 4, Kind: ledgerclient.EventKindPendingVoided, DedupID: "void-1", FromAccount: "a", ToAccount: "b", AmountMinor: 500},
+		{RaftIndex: 5, Kind: ledgerclient.EventKindCommandRejected, DedupID: "bad-1", ErrCode: "insufficient_funds"},
+		{RaftIndex: 6, Kind: ledgerclient.EventKindCommandDuplicate, DedupID: "hold-1"},
+	}
+	plan := BuildPlan(events, inSet("a", "b"))
+	if len(plan.Transfers) != 0 || len(plan.Journals) != 0 || len(plan.SkippedCrossShard) != 0 {
+		t.Errorf("expected no balance movements, got %+v", plan)
+	}
+	if !reflect.DeepEqual(plan.Accounts, []string{"a", "b"}) {
+		t.Errorf("Accounts = %v, want [a b]", plan.Accounts)
+	}
+}
+
+func TestBuildPlanReversalJournalReplayedVerbatim(t *testing.T) {
+	// A reversal's emitted lines are already the flipped legs; the plan
+	// treats it like any other journal so replay reproduces its effect.
+	events := []ledgerclient.Event{
+		{RaftIndex: 1, Kind: ledgerclient.EventKindAccountCreated, AccountID: "a"},
+		{RaftIndex: 2, Kind: ledgerclient.EventKindAccountCreated, AccountID: "b"},
+		{RaftIndex: 3, Kind: ledgerclient.EventKindTransferApplied, DedupID: "t1", FromAccount: "a", ToAccount: "b", AmountMinor: 100, Currency: "USD"},
+		{RaftIndex: 4, Kind: ledgerclient.EventKindJournalApplied, DedupID: "rev-1", ReversalOf: "t1", Lines: []ledgerclient.EventJournalLine{
+			{AccountID: "a", Direction: "credit", AmountMinor: 100, Currency: "USD"},
+			{AccountID: "b", Direction: "debit", AmountMinor: 100, Currency: "USD"},
+		}},
+	}
+	plan := BuildPlan(events, inSet("a", "b"))
+	if len(plan.Transfers) != 1 || len(plan.Journals) != 1 {
+		t.Fatalf("plan = %+v, want 1 transfer + 1 reversal journal", plan)
+	}
+	if plan.Journals[0].ReversalOf != "t1" {
+		t.Errorf("ReversalOf = %q, want t1", plan.Journals[0].ReversalOf)
+	}
+}

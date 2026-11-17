@@ -4,12 +4,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/ledgerline/ledgerline-raft/internal/httpapi"
 	"github.com/ledgerline/ledgerline-raft/internal/raftnode"
@@ -45,6 +50,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "directory for raft log/snapshot storage (defaults to ./data/<node-id>)")
 	bootstrap := flag.Bool("bootstrap", false, "bootstrap a brand-new cluster with -peers as the initial voter set (set on exactly one node)")
 	peersFlag := flag.String("peers", "", "comma-separated id=raftAddr=httpAddr entries for every cluster member, including this one")
+	authConfigPath := flag.String("auth-config", "", "path to a JSON API-key table enabling auth + tenant isolation (unset = open demo mode)")
 	flag.Parse()
 
 	if *nodeID == "" {
@@ -84,13 +90,40 @@ func main() {
 		log.Fatalf("start raft node: %v", err)
 	}
 
+	var authCfg *httpapi.AuthConfig
+	if *authConfigPath != "" {
+		authCfg, err = httpapi.LoadAuthConfig(*authConfigPath)
+		if err != nil {
+			log.Fatalf("load -auth-config: %v", err)
+		}
+	}
+
 	server := httpapi.NewServer(httpapi.Config{
 		Node:          node,
 		PeerHTTPAddrs: httpByID,
+		Auth:          authCfg,
 	})
 
-	log.Printf("ledgerd node=%s raft=%s http=%s bootstrap=%v", *nodeID, *raftBindAddr, *httpAddr, *bootstrap)
-	if err := http.ListenAndServe(*httpAddr, server.Handler()); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	httpServer := &http.Server{Addr: *httpAddr, Handler: server.Handler()}
+	go func() {
+		<-ctx.Done()
+		// Event-stream connections are long-lived; don't let Shutdown block
+		// on them forever — give them a grace period, then force-close.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			httpServer.Close()
+		}
+	}()
+
+	log.Printf("ledgerd node=%s raft=%s http=%s bootstrap=%v auth=%v", *nodeID, *raftBindAddr, *httpAddr, *bootstrap, authCfg != nil)
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		log.Printf("node close: %v", err)
 	}
 }

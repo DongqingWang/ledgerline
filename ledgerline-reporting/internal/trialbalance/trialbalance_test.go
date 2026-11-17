@@ -4,18 +4,18 @@ import "testing"
 
 func TestBuildTrialBalance_MultipleGLAccounts(t *testing.T) {
 	rows := []JournalRow{
-		{GLAccount: "1000", Direction: "debit", AmountMinor: 100000},
-		{GLAccount: "1000", Direction: "credit", AmountMinor: 100000},
-		{GLAccount: "4000", Direction: "debit", AmountMinor: 1500},
-		{GLAccount: "4000", Direction: "debit", AmountMinor: 1250},
-		{GLAccount: "4000", Direction: "credit", AmountMinor: 2750},
+		{GLAccount: "1000", Currency: "USD", Direction: "debit", AmountMinor: 100000},
+		{GLAccount: "1000", Currency: "USD", Direction: "credit", AmountMinor: 100000},
+		{GLAccount: "4000", Currency: "USD", Direction: "debit", AmountMinor: 1500},
+		{GLAccount: "4000", Currency: "USD", Direction: "debit", AmountMinor: 1250},
+		{GLAccount: "4000", Currency: "USD", Direction: "credit", AmountMinor: 2750},
 	}
 
 	got := BuildTrialBalance(rows)
 
 	want := []GLBalance{
-		{GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000, NetMinor: 0},
-		{GLAccount: "4000", TotalDebitMinor: 2750, TotalCreditMinor: 2750, NetMinor: 0},
+		{Currency: "USD", GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000, NetMinor: 0},
+		{Currency: "USD", GLAccount: "4000", TotalDebitMinor: 2750, TotalCreditMinor: 2750, NetMinor: 0},
 	}
 
 	if len(got) != len(want) {
@@ -28,12 +28,28 @@ func TestBuildTrialBalance_MultipleGLAccounts(t *testing.T) {
 	}
 }
 
+func TestBuildTrialBalance_GroupsPerCurrency(t *testing.T) {
+	rows := []JournalRow{
+		{GLAccount: "1000", Currency: "USD", Direction: "debit", AmountMinor: 100},
+		{GLAccount: "1000", Currency: "USD", Direction: "credit", AmountMinor: 100},
+		{GLAccount: "1000", Currency: "EUR", Direction: "debit", AmountMinor: 90},
+		{GLAccount: "1000", Currency: "EUR", Direction: "credit", AmountMinor: 90},
+	}
+	got := BuildTrialBalance(rows)
+	if len(got) != 2 {
+		t.Fatalf("same GL in two currencies must produce two rows, got %+v", got)
+	}
+	if got[0].Currency != "EUR" || got[1].Currency != "USD" {
+		t.Fatalf("expected currency-sorted output, got %+v", got)
+	}
+}
+
 func TestBuildTrialBalance_NullGLAccountBucketsAsUnspecified(t *testing.T) {
 	rows := []JournalRow{
-		{GLAccount: "", Direction: "debit", AmountMinor: 300},
-		{GLAccount: "", Direction: "credit", AmountMinor: 300},
-		{GLAccount: "1000", Direction: "debit", AmountMinor: 500},
-		{GLAccount: "1000", Direction: "credit", AmountMinor: 500},
+		{GLAccount: "", Currency: "USD", Direction: "debit", AmountMinor: 300},
+		{GLAccount: "", Currency: "USD", Direction: "credit", AmountMinor: 300},
+		{GLAccount: "1000", Currency: "USD", Direction: "debit", AmountMinor: 500},
+		{GLAccount: "1000", Currency: "USD", Direction: "credit", AmountMinor: 500},
 	}
 
 	got := BuildTrialBalance(rows)
@@ -59,51 +75,59 @@ func TestBuildTrialBalance_EmptyInput(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("got %d balances for empty input, want 0: %+v", len(got), got)
 	}
-
-	ok, debits, credits := Reconcile(got)
-	if !ok {
-		t.Errorf("Reconcile(empty) ok = false, want true")
-	}
-	if debits != 0 || credits != 0 {
-		t.Errorf("Reconcile(empty) = (debits=%d, credits=%d), want (0, 0)", debits, credits)
+	if checks := ReconcileByCurrency(got); len(checks) != 0 {
+		t.Errorf("ReconcileByCurrency(empty) = %+v, want no checks", checks)
 	}
 }
 
-func TestReconcile_Balanced(t *testing.T) {
+func TestReconcileByCurrency_Balanced(t *testing.T) {
 	balances := []GLBalance{
-		{GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000},
-		{GLAccount: "4000", TotalDebitMinor: 2750, TotalCreditMinor: 2750},
-		{GLAccount: UnspecifiedGLAccount, TotalDebitMinor: 600, TotalCreditMinor: 600},
+		{Currency: "USD", GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000},
+		{Currency: "USD", GLAccount: "4000", TotalDebitMinor: 2750, TotalCreditMinor: 2750},
+		{Currency: "USD", GLAccount: UnspecifiedGLAccount, TotalDebitMinor: 600, TotalCreditMinor: 600},
 	}
 
-	ok, debits, credits := Reconcile(balances)
-	if !ok {
-		t.Errorf("Reconcile() ok = false, want true (debits=%d, credits=%d)", debits, credits)
+	checks := ReconcileByCurrency(balances)
+	if len(checks) != 1 {
+		t.Fatalf("expected 1 currency check, got %+v", checks)
 	}
-	if debits != 103350 || credits != 103350 {
-		t.Errorf("Reconcile() = (debits=%d, credits=%d), want (103350, 103350)", debits, credits)
+	c := checks[0]
+	if !c.OK || c.Debits != 103350 || c.Credits != 103350 {
+		t.Errorf("USD check = %+v, want OK with 103350/103350", c)
 	}
 }
 
-func TestReconcile_UnbalancedCatchesDiff(t *testing.T) {
-	// Intentionally unbalanced fixture: GL account "9999" has more debits
-	// than credits, simulating a missing offsetting entry or a bug upstream.
+func TestReconcileByCurrency_UnbalancedCatchesDiff(t *testing.T) {
 	balances := []GLBalance{
-		{GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000},
-		{GLAccount: "9999", TotalDebitMinor: 5000, TotalCreditMinor: 3000},
+		{Currency: "USD", GLAccount: "1000", TotalDebitMinor: 100000, TotalCreditMinor: 100000},
+		{Currency: "USD", GLAccount: "9999", TotalDebitMinor: 5000, TotalCreditMinor: 3000},
 	}
 
-	ok, debits, credits := Reconcile(balances)
-	if ok {
-		t.Fatalf("Reconcile() ok = true, want false for unbalanced input")
+	checks := ReconcileByCurrency(balances)
+	if len(checks) != 1 || checks[0].OK {
+		t.Fatalf("expected a failing USD check, got %+v", checks)
 	}
-	if debits != 105000 {
-		t.Errorf("debits = %d, want 105000", debits)
+	if checks[0].Debits != 105000 || checks[0].Credits != 103000 {
+		t.Errorf("totals = %d/%d, want 105000/103000", checks[0].Debits, checks[0].Credits)
 	}
-	if credits != 103000 {
-		t.Errorf("credits = %d, want 103000", credits)
+}
+
+// TestReconcileByCurrency_CrossCurrencyTrap is the regression test for the
+// original bug: a single global sum can "balance" even when every individual
+// currency is broken, because diffs in different currencies cancel out.
+func TestReconcileByCurrency_CrossCurrencyTrap(t *testing.T) {
+	balances := []GLBalance{
+		{Currency: "USD", GLAccount: "1000", TotalDebitMinor: 100, TotalCreditMinor: 90}, // USD off by +10
+		{Currency: "EUR", GLAccount: "1000", TotalDebitMinor: 90, TotalCreditMinor: 100}, // EUR off by -10
 	}
-	if diff := debits - credits; diff != 2000 {
-		t.Errorf("diff = %d, want 2000", diff)
+	// Global sums would be 190 == 190 (false PASS). Per-currency must fail both.
+	checks := ReconcileByCurrency(balances)
+	if len(checks) != 2 {
+		t.Fatalf("expected 2 checks, got %+v", checks)
+	}
+	for _, c := range checks {
+		if c.OK {
+			t.Errorf("currency %s must FAIL despite cancelling global sums: %+v", c.Currency, c)
+		}
 	}
 }

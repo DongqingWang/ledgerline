@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ func main() {
 	ledgerNodes := flag.String("ledger-nodes", "",
 		"comma-separated candidate ledgerline-raft HTTP addresses, e.g. 127.0.0.1:8001,127.0.0.1:8002")
 	httpAddr := flag.String("http-addr", "127.0.0.1:8380", "address for this service's own HTTP health endpoint")
+	apiKey := flag.String("api-key", "", "admin API key for the engine's event stream (required when the engine runs with -auth-config)")
 	flag.Parse()
 
 	candidates := splitAndTrim(*ledgerNodes)
@@ -60,7 +62,25 @@ func main() {
 	}()
 
 	client := streamclient.New(candidates)
+	client.APIKey = *apiKey
+
+	// expected is the next raft index we must see. The engine emits exactly
+	// one event per committed log entry, so any deviation is a delivery gap:
+	// refuse the event, drop the connection, and reconnect from the durable
+	// DB position (resume below re-seeds expected on every attempt).
+	expected := startIdx + 1
+	resume := func(ctx context.Context) (int64, error) {
+		idx, err := db.LastRaftIndex(ctx)
+		if err == nil {
+			expected = idx + 1
+		}
+		return idx, err
+	}
+
 	handle := func(ctx context.Context, ev events.LedgerEvent) error {
+		if ev.RaftIndex != expected {
+			return fmt.Errorf("event stream gap: expected raft_index=%d, got %d (kind=%s); reconnecting from durable position", expected, ev.RaftIndex, ev.Kind)
+		}
 		switch ev.Kind {
 		case events.KindAccountCreated:
 			if err := db.ApplyAccountCreated(ctx, ev); err != nil {
@@ -73,13 +93,29 @@ func main() {
 			}
 			log.Printf("persistence-sync: applied transfer_applied raft_index=%d dedup_id=%s from=%s to=%s amount_minor=%d",
 				ev.RaftIndex, ev.DedupID, ev.FromAccount, ev.ToAccount, ev.AmountMinor)
+		case events.KindJournalApplied:
+			if err := db.ApplyJournalApplied(ctx, ev); err != nil {
+				return err
+			}
+			log.Printf("persistence-sync: applied journal_applied raft_index=%d dedup_id=%s legs=%d reversal_of=%s",
+				ev.RaftIndex, ev.DedupID, len(ev.Lines), ev.ReversalOf)
+		case events.KindPendingCreated, events.KindPendingPosted, events.KindPendingVoided:
+			if err := db.ApplyPendingEvent(ctx, ev); err != nil {
+				return err
+			}
+			log.Printf("persistence-sync: applied %s raft_index=%d pending_id=%s dedup_id=%s", ev.Kind, ev.RaftIndex, ev.PendingID, ev.DedupID)
+		case events.KindCommandRejected, events.KindCommandDuplicate:
+			if err := db.ApplyNoOp(ctx, ev); err != nil {
+				return err
+			}
 		default:
-			log.Printf("persistence-sync: skipping unknown event kind %q at raft_index=%d", ev.Kind, ev.RaftIndex)
+			return fmt.Errorf("unknown event kind %q at raft_index=%d; refusing to skip (would silently corrupt the projection)", ev.Kind, ev.RaftIndex)
 		}
+		expected = ev.RaftIndex + 1
 		return nil
 	}
 
-	err = streamclient.RunWithReconnect(ctx, client, db.LastRaftIndex, handle)
+	err = streamclient.RunWithReconnect(ctx, client, resume, handle)
 	if err != nil && ctx.Err() == nil {
 		log.Fatalf("persistence-sync: stream loop exited: %v", err)
 	}

@@ -75,10 +75,11 @@ func Start(cfg Config) (*Node, error) {
 	var logStore raft.LogStore = boltStore
 	var stableStore raft.StableStore = boltStore
 
-	f := fsm.New()
+	f := fsm.New(filepath.Join(cfg.DataDir, "events.ndjson"))
 
 	r, err := raft.NewRaft(raftConfig, f, logStore, stableStore, snapshots, transport)
 	if err != nil {
+		f.Close()
 		return nil, fmt.Errorf("create raft node: %w", err)
 	}
 
@@ -109,3 +110,12 @@ func Start(cfg Config) (*Node, error) {
 // only knows the leader's *raft* address, not its HTTP address, so the
 // server package maintains that mapping (see httpapi.Server).
 func (n *Node) IsLeader() bool { return n.Raft.State() == raft.Leader }
+
+// Close shuts down raft and releases the FSM's durable event log.
+func (n *Node) Close() error {
+	err := n.Raft.Shutdown().Error()
+	if cerr := n.FSM.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	return err
+}

@@ -9,6 +9,7 @@ package ledgerclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,17 +25,24 @@ const MaxAttempts = 5
 
 // Account mirrors ledgerline-raft's account JSON representation.
 type Account struct {
-	AccountID    string `json:"account_id"`
-	Currency     string `json:"currency"`
-	BalanceMinor int64  `json:"balance_minor"`
-	Unlimited    bool   `json:"unlimited"`
+	AccountID          string `json:"account_id"`
+	Currency           string `json:"currency"`
+	BalanceMinor       int64  `json:"balance_minor"`
+	PendingDebitsMinor int64  `json:"pending_debits_minor"`
+	AvailableMinor     int64  `json:"available_minor"`
+	Unlimited          bool   `json:"unlimited"`
+	Type               string `json:"type,omitempty"`
+	TenantID           string `json:"tenant_id,omitempty"`
 }
 
-// CreateAccountRequest mirrors the POST /v1/accounts request body.
+// CreateAccountRequest mirrors the POST /v1/accounts request body. Tenant
+// ownership is assigned server-side from the authenticated caller (see
+// WithTenant for acting on behalf of a tenant with an admin key).
 type CreateAccountRequest struct {
 	AccountID string `json:"account_id"`
 	Currency  string `json:"currency"`
 	Unlimited bool   `json:"unlimited"`
+	Type      string `json:"type,omitempty"`
 }
 
 // TransferRequest mirrors the POST /v1/transfers request body.
@@ -48,11 +56,34 @@ type TransferRequest struct {
 	CostCenter  string `json:"cost_center,omitempty"`
 }
 
-// TransferResult mirrors the POST /v1/transfers response body.
+// TransferResult mirrors the POST /v1/transfers and /v1/journals response
+// body.
 type TransferResult struct {
 	Status    string `json:"status"`
 	JournalID string `json:"journal_id"`
 	RaftIndex int64  `json:"raft_index"`
+}
+
+// JournalLine is one leg of a multi-leg journal, with its own GL dimensions.
+type JournalLine struct {
+	AccountID   string `json:"account_id"`
+	Direction   string `json:"direction"` // "debit" or "credit"
+	AmountMinor int64  `json:"amount_minor"`
+	GLAccount   string `json:"gl_account,omitempty"`
+	CostCenter  string `json:"cost_center,omitempty"`
+}
+
+// JournalRequest mirrors the POST /v1/journals request body: an atomic,
+// idempotent multi-leg journal that must balance per currency.
+type JournalRequest struct {
+	DedupID string        `json:"dedup_id"`
+	Lines   []JournalLine `json:"lines"`
+}
+
+// ReverseRequest mirrors the POST /v1/reversals request body.
+type ReverseRequest struct {
+	DedupID         string `json:"dedup_id"`
+	OriginalDedupID string `json:"original_dedup_id"`
 }
 
 // LeaderInfo mirrors the GET /v1/leader response body.
@@ -82,12 +113,26 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("ledgerclient: %s (code=%s, status=%d)", e.Message, e.Code, e.StatusCode)
 }
 
+type tenantCtxKey struct{}
+
+// WithTenant returns a context that makes the client send X-Tenant-ID on
+// requests made with it. Only meaningful when the client's APIKey is an
+// engine admin key: the engine stamps tenant ownership server-side, so the
+// gateway acts on behalf of the authenticated tenant via this header.
+func WithTenant(ctx context.Context, tenant string) context.Context {
+	return context.WithValue(ctx, tenantCtxKey{}, tenant)
+}
+
 // Client talks to a ledgerline-raft cluster using the leader-follow retry
 // pattern: try a candidate node, and if told "not_leader" with a leader
 // hint, retry against that hint. The last-known-good leader address is
 // remembered across calls as an optimization.
 type Client struct {
 	HTTPClient *http.Client
+	// APIKey, when non-empty, is sent as X-API-Key on every request. The
+	// gateway uses an engine admin service key and selects the acting
+	// tenant per request via WithTenant.
+	APIKey string
 
 	mu         sync.Mutex
 	nodes      []string // static list of node http addresses, as configured
@@ -151,7 +196,7 @@ func (c *Client) clearLeader(addr string) {
 // hints, up to MaxAttempts total tries. method/path/body describe the
 // request to issue against each candidate's base address. On success, out
 // (if non-nil) is populated by decoding the JSON response body.
-func (c *Client) doWithRetry(method, path string, body []byte, out interface{}) error {
+func (c *Client) doWithRetry(ctx context.Context, method, path string, body []byte, out interface{}) error {
 	candidates := c.candidateOrder()
 	if len(candidates) == 0 {
 		return errors.New("ledgerclient: no ledger nodes configured")
@@ -169,7 +214,7 @@ func (c *Client) doWithRetry(method, path string, body []byte, out interface{}) 
 		attempts++
 		tried[addr] = true
 
-		status, respBody, err := c.doOnce(method, addr, path, body)
+		status, respBody, err := c.doOnce(ctx, method, addr, path, body)
 		if err != nil {
 			lastErr = err
 			c.clearLeader(addr)
@@ -237,18 +282,24 @@ func pickUntried(candidates []string, tried map[string]bool, idx *int) string {
 	return ""
 }
 
-func (c *Client) doOnce(method, addr, path string, body []byte) (int, []byte, error) {
+func (c *Client) doOnce(ctx context.Context, method, addr, path string, body []byte) (int, []byte, error) {
 	url := "http://" + addr + path
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, url, reader)
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return 0, nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.APIKey != "" {
+		req.Header.Set("X-API-Key", c.APIKey)
+	}
+	if tenant, ok := ctx.Value(tenantCtxKey{}).(string); ok && tenant != "" {
+		req.Header.Set("X-Tenant-ID", tenant)
 	}
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -264,13 +315,13 @@ func (c *Client) doOnce(method, addr, path string, body []byte) (int, []byte, er
 
 // CreateAccount creates an account on the leader, following not_leader
 // hints as needed.
-func (c *Client) CreateAccount(req CreateAccountRequest) (*Account, error) {
+func (c *Client) CreateAccount(ctx context.Context, req CreateAccountRequest) (*Account, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	var acct Account
-	if err := c.doWithRetry(http.MethodPost, "/v1/accounts", body, &acct); err != nil {
+	if err := c.doWithRetry(ctx, http.MethodPost, "/v1/accounts", body, &acct); err != nil {
 		return nil, err
 	}
 	return &acct, nil
@@ -278,13 +329,41 @@ func (c *Client) CreateAccount(req CreateAccountRequest) (*Account, error) {
 
 // Transfer submits a transfer to the leader, following not_leader hints as
 // needed.
-func (c *Client) Transfer(req TransferRequest) (*TransferResult, error) {
+func (c *Client) Transfer(ctx context.Context, req TransferRequest) (*TransferResult, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	var result TransferResult
-	if err := c.doWithRetry(http.MethodPost, "/v1/transfers", body, &result); err != nil {
+	if err := c.doWithRetry(ctx, http.MethodPost, "/v1/transfers", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Journal submits an atomic multi-leg journal to the leader, following
+// not_leader hints as needed. Idempotent on DedupID.
+func (c *Client) Journal(ctx context.Context, req JournalRequest) (*TransferResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var result TransferResult
+	if err := c.doWithRetry(ctx, http.MethodPost, "/v1/journals", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Reverse submits a reversal of a previously applied transfer/journal to
+// the leader, following not_leader hints as needed. Idempotent on DedupID.
+func (c *Client) Reverse(ctx context.Context, req ReverseRequest) (*TransferResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var result TransferResult
+	if err := c.doWithRetry(ctx, http.MethodPost, "/v1/reversals", body, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -292,9 +371,9 @@ func (c *Client) Transfer(req TransferRequest) (*TransferResult, error) {
 
 // GetAccount fetches an account's current state. Any reachable node can
 // serve this (follower reads may be slightly stale).
-func (c *Client) GetAccount(accountID string) (*Account, error) {
+func (c *Client) GetAccount(ctx context.Context, accountID string) (*Account, error) {
 	var acct Account
-	if err := c.doWithRetry(http.MethodGet, "/v1/accounts/"+accountID, nil, &acct); err != nil {
+	if err := c.doWithRetry(ctx, http.MethodGet, "/v1/accounts/"+accountID, nil, &acct); err != nil {
 		return nil, err
 	}
 	return &acct, nil
@@ -302,9 +381,9 @@ func (c *Client) GetAccount(accountID string) (*Account, error) {
 
 // Leader returns the cluster's current leader info, as reported by whichever
 // node answers first.
-func (c *Client) Leader() (*LeaderInfo, error) {
+func (c *Client) Leader(ctx context.Context) (*LeaderInfo, error) {
 	var info LeaderInfo
-	if err := c.doWithRetry(http.MethodGet, "/v1/leader", nil, &info); err != nil {
+	if err := c.doWithRetry(ctx, http.MethodGet, "/v1/leader", nil, &info); err != nil {
 		return nil, err
 	}
 	return &info, nil

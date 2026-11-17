@@ -16,18 +16,31 @@ import (
 // If the connection drops or a candidate node is unreachable, it reconnects
 // -- trying candidates in order -- resuming from the last-processed
 // raft_index+1 so no events are skipped or double counted.
+//
+// The cache rejects index gaps (the engine guarantees one event per log
+// entry). A gap first triggers reconnect-from-watermark; if the same gap
+// survives maxGapRetries consecutive attempts, the missing events are
+// unrecoverable from the stream, so the cache is wiped and fully resynced
+// from index 0 (loudly logged — silent balance drift is the failure mode
+// this whole mechanism exists to prevent).
 type Streamer struct {
 	nodes  []string
 	cache  *BalanceCache
 	client *http.Client
+	apiKey string
 }
 
+const maxGapRetries = 5
+
 // NewStreamer builds a Streamer over the given candidate node HTTP
-// addresses (host:port, no scheme).
-func NewStreamer(nodes []string, cache *BalanceCache) *Streamer {
+// addresses (host:port, no scheme). apiKey may be empty when the engine
+// runs without -auth-config; otherwise it must be an admin key (the event
+// stream carries all tenants' events).
+func NewStreamer(nodes []string, cache *BalanceCache, apiKey string) *Streamer {
 	return &Streamer{
-		nodes: nodes,
-		cache: cache,
+		nodes:  nodes,
+		cache:  cache,
+		apiKey: apiKey,
 		client: &http.Client{
 			// No overall timeout: this is a long-lived streaming connection.
 			// Per-attempt dial/header timeouts are handled via the request
@@ -43,6 +56,8 @@ func NewStreamer(nodes []string, cache *BalanceCache) *Streamer {
 func (s *Streamer) Run(ctx context.Context) {
 	backoff := 500 * time.Millisecond
 	const maxBackoff = 10 * time.Second
+	stuckAt := uint64(0)
+	stuckCount := 0
 
 	for {
 		if ctx.Err() != nil {
@@ -76,6 +91,20 @@ func (s *Streamer) Run(ctx context.Context) {
 			}
 			log.Printf("streamer: connection to %s ended: %v", node, err)
 			connected = true // we at least tried; move to next candidate
+
+			// Track attempts that fail without advancing the watermark.
+			if fromIndex == stuckAt {
+				stuckCount++
+			} else {
+				stuckAt = fromIndex
+				stuckCount = 1
+			}
+			if stuckCount >= maxGapRetries {
+				log.Printf("streamer: CRITICAL: %d consecutive attempts stuck at from_index=%d (event stream gap cannot be healed by reconnect); wiping cache and resyncing from index 0", stuckCount, fromIndex)
+				s.cache.Reset()
+				stuckAt = 0
+				stuckCount = 0
+			}
 		}
 
 		if !connected {
@@ -104,6 +133,9 @@ func (s *Streamer) streamFrom(ctx context.Context, node string, fromIndex uint64
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
+	}
+	if s.apiKey != "" {
+		req.Header.Set("X-API-Key", s.apiKey)
 	}
 
 	resp, err := s.client.Do(req)
@@ -134,7 +166,9 @@ func (s *Streamer) streamFrom(ctx context.Context, node string, fromIndex uint64
 			}
 			return fmt.Errorf("decode error from %s: %w", node, err)
 		}
-		s.cache.Apply(ev)
+		if err := s.cache.Apply(ev); err != nil {
+			return fmt.Errorf("apply index %d from %s: %w", ev.RaftIndex, node, err)
+		}
 		count++
 		if count%1000 == 0 {
 			log.Printf("streamer: applied %d events from %s (last index %d)", count, node, ev.RaftIndex)

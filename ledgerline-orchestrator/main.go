@@ -27,6 +27,7 @@ import (
 func main() {
 	httpAddr := flag.String("http-addr", "127.0.0.1:8480", "address for the orchestrator's own HTTP API")
 	initialNodes := flag.String("initial-ledger-nodes", "", "comma-separated HTTP addresses of the initial ledgerline-raft cluster's nodes (required); this cluster is assigned the single starting shard covering the full key range")
+	apiKey := flag.String("api-key", "", "admin API key for the ledgerline-raft clusters, when they have auth enabled (sent as X-API-Key; tenant replay uses X-Tenant-ID)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "ledgerline-orchestrator ", log.LstdFlags)
@@ -40,6 +41,7 @@ func main() {
 
 	table := shard.NewTable(nodes)
 	client := ledgerclient.NewClient()
+	client.APIKey = *apiKey
 	orch := controller.New(table, client, logger)
 
 	server := &httpapi.Server{

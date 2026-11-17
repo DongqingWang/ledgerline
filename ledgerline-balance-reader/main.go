@@ -22,6 +22,7 @@ const shutdownTimeout = 5 * time.Second
 func main() {
 	httpAddr := flag.String("http-addr", "127.0.0.1:8280", "this service's own HTTP listen address")
 	ledgerNodes := flag.String("ledger-nodes", "", "comma-separated list of candidate ledgerline-raft HTTP addresses, e.g. 127.0.0.1:8201,127.0.0.1:8202")
+	apiKey := flag.String("api-key", "", "admin API key for the engine's event stream (required when the engine runs with -auth-config)")
 	flag.Parse()
 
 	nodes := splitAndTrim(*ledgerNodes)
@@ -34,7 +35,7 @@ func main() {
 
 	cache := NewBalanceCache()
 
-	streamer := NewStreamer(nodes, cache)
+	streamer := NewStreamer(nodes, cache, *apiKey)
 	go streamer.Run(ctx)
 
 	srv := &http.Server{

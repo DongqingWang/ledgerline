@@ -22,14 +22,14 @@ as its own repo; see `git log -- <dir>` to see that history).
 
 | Directory | Role |
 |---|---|
-| [`ledgerline-raft`](./ledgerline-raft) | The core: a Raft-replicated, event-sourced ledger engine. Idempotent `AssertTransfer`, double-entry by construction, a committed-event stream for CQRS fan-out. |
+| [`ledgerline-raft`](./ledgerline-raft) | The core: a Raft-replicated, event-sourced ledger engine. Idempotent `AssertTransfer` and atomic multi-leg `AssertJournal`, reversals, two-phase pending transfers, per-currency double-entry invariants, durable event replay, optional API-key auth with tenant isolation, and a committed-event stream for CQRS fan-out. |
 | [`ledgerline-accounting-core`](./ledgerline-accounting-core) | Double-entry journal composer + GL-dimension rule engine. Classifies a transfer's business context into GL account/cost center before it's submitted to the ledger. |
-| [`ledgerline-gateway`](./ledgerline-gateway) | Client-facing REST API. Leader discovery/retry into the raft cluster, composes journals via accounting-core first. |
-| [`ledgerline-balance-reader`](./ledgerline-balance-reader) | Fast CQRS read-path: tails the engine's event stream into an in-memory cache instead of querying the engine on every read. |
-| [`ledgerline-persistence-sync`](./ledgerline-persistence-sync) | Projects committed events into durable Postgres tables — the queryable system of record for reporting/reconciliation. |
+| [`ledgerline-gateway`](./ledgerline-gateway) | Client-facing REST API. Leader discovery/retry into the raft cluster, composes journals via accounting-core and posts them as one atomic journal; FX cross-currency payouts via position accounts; reversal passthrough; optional tenant auth. |
+| [`ledgerline-balance-reader`](./ledgerline-balance-reader) | Fast CQRS read-path: tails the engine's event stream into an in-memory cache instead of querying the engine on every read. Enforces raft-index contiguity and resyncs from scratch if a gap can't be healed. |
+| [`ledgerline-persistence-sync`](./ledgerline-persistence-sync) | Projects committed events into durable Postgres tables — the queryable system of record for reporting/reconciliation. Per-leg journal rows with their own GL codes, pending-hold projection, index-continuity enforcement. |
 | [`ledgerline-fx`](./ledgerline-fx) | Independent FX rate service: static seed rates + optional live refresh, cross-rate derivation, conversion. |
-| [`ledgerline-orchestrator`](./ledgerline-orchestrator) | Demo shard-split controller: routing table + a (simplified) split operation that stands up a new cluster, replays history into it, and atomically swaps routing. |
-| [`ledgerline-reporting`](./ledgerline-reporting) | Trial Balance / reconciliation batch CLI reading the Postgres projection. Exits non-zero if debits ≠ credits. |
+| [`ledgerline-orchestrator`](./ledgerline-orchestrator) | Demo shard-split controller: routing table + a (simplified) split operation that stands up a new cluster, replays history into it (transfers, journals, posted holds), and atomically swaps routing. |
+| [`ledgerline-reporting`](./ledgerline-reporting) | Trial Balance / reconciliation batch CLI reading the Postgres projection. Reconciles debits = credits **per currency** and exits non-zero if any currency fails. |
 | [`ledgerline-ai-gateway`](./ledgerline-ai-gateway) | An MCP server exposing read-only ledger-query tools to AI agents, with field-level redaction, a least-privilege DB role, and audit logging. |
 | [`ledgerline-admin-console`](./ledgerline-admin-console) | A small local demo web UI: balances, a transfer form, FX rates. |
 | *(repo root)* | This README, `docker-compose.yml`, and the demo scripts tying everything together. |
@@ -43,7 +43,7 @@ flowchart TB
         ACC["ledgerline-accounting-core<br/>(journal composition)"]
         RAFT["ledgerline-raft<br/>3-node cluster<br/>(event-sourced, Raft-replicated)"]
         GW -->|compose journal| ACC
-        GW -->|AssertTransfer| RAFT
+        GW -->|AssertJournal| RAFT
     end
 
     subgraph read_paths["Read Paths (CQRS fan-out from the committed event stream)"]
@@ -69,18 +69,24 @@ flowchart TB
     UI -->|transfers| GW
     UI -->|balances| BR
     UI -->|rates| FX
+    GW -->|convert (cross-currency)| FX
     ORCH -.->|admin ops on| RAFT
 ```
 
 **Data flow for a transfer**: a client calls `ledgerline-gateway`, which asks
 `ledgerline-accounting-core` to classify the transfer into a balanced,
-GL-tagged journal, then submits it to `ledgerline-raft` as one or two
-idempotent `AssertTransfer` calls (two, if there's a fee split — see
-"Known simplifications" below). The raft leader commits it to its replicated
-log, applies it to the state machine, and emits it on the committed-event
-stream. `ledgerline-balance-reader` and `ledgerline-persistence-sync` both
+GL-tagged journal, then submits it to `ledgerline-raft` as **one atomic
+`AssertJournal`** — every leg (including a fee leg, each with its own GL
+code) commits in a single raft log entry or none do. A cross-currency
+request (`to_currency`) additionally asks `ledgerline-fx` for the converted
+amount and posts a 4-leg journal through the platform's fx-position
+accounts, with each currency balancing independently. The raft leader
+commits it to its replicated log, applies it to the state machine, and emits
+exactly one event per log entry on the committed-event stream.
+`ledgerline-balance-reader` and `ledgerline-persistence-sync` both
 tail that same stream independently — one for fast in-memory reads, one for
-a durable, queryable Postgres projection. `ledgerline-reporting` and
+a durable, queryable Postgres projection — and both refuse to apply events
+across a raft-index gap. `ledgerline-reporting` and
 `ledgerline-ai-gateway` both read from that Postgres projection, never from
 the engine directly, so analytics and AI-agent access are strictly read-path
 concerns that can never compete with or block the operational write path.
@@ -133,19 +139,54 @@ by: here's what actually went wrong while building it, not just what works.
   (wildcard) CORS middleware in `gateway`, `balance-reader`, and `fx` —
   documented in each as a local-demo-only simplification, not something
   you'd want on a public deployment.
-- **A single, per-transfer GL code, not per-leg.** `ledgerline-raft`'s
-  `AssertTransfer` takes one `gl_account`/`cost_center` pair for the whole
-  transfer (it's a simple two-party primitive), while
-  `ledgerline-accounting-core` can assign *different* GL codes to the debit
-  and credit legs. The gateway currently tags a raft-level transfer with the
-  **credit leg's** GL code, which means `ledgerline-persistence-sync`'s
-  journal rows end up with the same GL code on both sides of a given
-  raft-level transfer — e.g. a fee-split payout's debit leg shows up under
-  the credit leg's revenue GL code (`4000`), not its own payout code
-  (`2100`). The books still balance (debits = credits, globally and per
-  transfer), it's just coarser GL attribution than the full accounting-core
-  model supports. A real fix would extend `AssertTransfer`'s wire shape to
-  carry a GL code per leg.
+- **A single, per-transfer GL code, not per-leg — FIXED.** `ledgerline-raft`'s
+  original `AssertTransfer` took one `gl_account`/`cost_center` pair for the
+  whole transfer (a simple two-party primitive), while
+  `ledgerline-accounting-core` assigns *different* GL codes to the debit and
+  credit legs. The old gateway tagged a raft-level transfer with the
+  **credit leg's** GL code, so a fee-split payout's debit leg showed up under
+  the credit leg's revenue GL code (`4000`) instead of its own payout code
+  (`2100`). The books balanced, but GL attribution was wrong. Fixed by
+  adding an atomic multi-leg `AssertJournal` primitive to the engine: each
+  leg carries its own GL dimensions, the gateway posts the composed journal
+  verbatim as one journal, and `ledgerline-persistence-sync` writes one
+  `journal_entries` row per leg (uniqueness key `(transfer_dedup_id,
+  line_index)`).
+- **A fee split was two sequential transfers, not one atomic journal —
+  FIXED.** The old gateway mapped a fee-split payout to a "net" transfer
+  plus a "fee" transfer. Concrete counterexample: balance 90, amount 100,
+  fee 20 → net(80) applied, fee(20) rejected for insufficient funds → 80
+  already moved, the API returned an error, and nothing reversed or even
+  guaranteed the retry that would eventually converge. Fixed by the same
+  `AssertJournal` primitive: the engine validates every leg's aggregate net
+  debit against available balance *before* mutating anything, so the whole
+  payout is all-or-nothing. Regression-tested at three levels (FSM unit
+  test, gateway stub test, live e2e: balance 90 / amount 100 / fee 20 → 422
+  with zero balance movement).
+- **The event stream could silently lose events — FIXED.** The old
+  in-memory-only bus dropped events for slow subscribers (non-blocking send
+  on a full channel) and lost all history on restart/snapshot compaction,
+  while consumers advanced their watermark regardless — a projection could
+  silently miss a transfer forever. Fixed on both sides: the engine now
+  appends every event to a durable `events.ndjson` (replayed on startup,
+  partial trailing line truncated) and *kicks* a subscriber whose buffer is
+  full, forcing it to reconnect from its watermark; exactly one event is
+  emitted per committed log entry (including `command_rejected` /
+  `command_duplicate`), so raft-index contiguity is a valid gap detector.
+  Both consumers now refuse to apply across a gap, and balance-reader
+  falls back to a full resync if a gap can't be healed. Verified live: a
+  restarted node replays its full history, and the stream's indices are
+  strictly contiguous.
+- **`reversal_of` linked to an ID that doesn't exist in the projection.**
+  Found by the end-to-end run after adding reversals: the engine stamped
+  the original entry's raft-derived `JournalID` (`jrn-12`) into
+  `reversal_of`, but `journal_entries` has no journal-id column — its only
+  entry identifier is `transfer_dedup_id`, so the link could never be
+  joined. Fixed to carry the original entry's **DedupID**, the stable
+  business idempotency key. **Lesson**: an event field's semantics have to
+  be checked against the schema that consumes it, not just against the
+  producer's own unit tests (both sides' tests had encoded the same wrong
+  assumption).
 - **`sync_state` is a single global counter with no notion of "which
   cluster."** `ledgerline-persistence-sync` resumes from
   `sync_state.last_raft_index` on restart — which is exactly right for
@@ -181,6 +222,30 @@ by: here's what actually went wrong while building it, not just what works.
   every dependent service refusing to start. Fixed by pointing each node's
   healthcheck at its own hostname instead of `localhost`. Found by actually
   running `docker compose up` and reading the failure, not by inspection.
+
+## Known simplifications
+
+The correctness core (atomic journals, per-currency balancing, deterministic
+expiry, durable replay, gap detection) is real and tested. What remains
+demo-grade, deliberately:
+
+- **Auth is a static JSON API-key table** (`-auth-config` on the engine and
+  gateway), not a real identity provider / key-management service. Tenant
+  ownership is stamped server-side and enforced at the HTTP boundary
+  (403 on cross-tenant writes, 404 on cross-tenant reads, admin-only event
+  stream); the enforcement points are where a real IdP would plug in.
+  Auth is off by default for local demos.
+- **`sync_state` is a single global counter** with no notion of "which
+  cluster" (see the bug story above) — one persistence-sync instance tracks
+  one cluster.
+- **The orchestrator's split does not migrate in-flight holds**: only
+  posted holds (which moved balances) are replayed, as transfers;
+  cross-shard journals/transfers are reported and skipped, not migrated.
+- **Cross-currency payouts don't support fees yet** (`fee_minor > 0` with
+  `to_currency` is a 422), and FX rates are fetched at request time with no
+  rate-lock/quote expiry.
+- **CORS is a permissive wildcard** in gateway/balance-reader/fx — local
+  demo only.
 
 ## License
 

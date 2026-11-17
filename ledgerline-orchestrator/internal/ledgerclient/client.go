@@ -15,6 +15,30 @@ import (
 // encoding/json and net/http from the standard library.
 type Client struct {
 	HTTPClient *http.Client
+	// APIKey, when non-empty, is sent as X-API-Key on every request. The
+	// orchestrator needs an admin key when the engine has auth enabled:
+	// it reads the full event stream and replays history across tenants.
+	APIKey string
+}
+
+type tenantCtxKey struct{}
+
+// WithTenant returns a context that makes the client send X-Tenant-ID on
+// requests made with it. Only meaningful with an admin API key: the engine
+// stamps tenant ownership server-side from the authenticated caller, so
+// replaying another tenant's accounts/journals requires acting as that
+// tenant.
+func WithTenant(ctx context.Context, tenant string) context.Context {
+	return context.WithValue(ctx, tenantCtxKey{}, tenant)
+}
+
+func (c *Client) setHeaders(req *http.Request) {
+	if c.APIKey != "" {
+		req.Header.Set("X-API-Key", c.APIKey)
+	}
+	if tenant, ok := req.Context().Value(tenantCtxKey{}).(string); ok && tenant != "" {
+		req.Header.Set("X-Tenant-ID", tenant)
+	}
 }
 
 // NewClient returns a Client with a sane default timeout for ordinary
@@ -48,6 +72,7 @@ func (c *Client) doJSON(ctx context.Context, method, url string, body, out inter
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.setHeaders(req)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -134,6 +159,14 @@ func (c *Client) SubmitTransfer(ctx context.Context, leaderAddr string, req Tran
 	return out, err
 }
 
+// SubmitJournal submits an atomic multi-leg journal on the given (leader)
+// node. It is idempotent on DedupID, so safe to retry.
+func (c *Client) SubmitJournal(ctx context.Context, leaderAddr string, req JournalRequest) (TransferResponse, error) {
+	var out TransferResponse
+	_, err := c.doJSON(ctx, http.MethodPost, addrToURL(leaderAddr, "/v1/journals"), req, &out)
+	return out, err
+}
+
 // StreamEvents reads the NDJSON event stream from addr starting at
 // fromIndex and returns every event seen before the stream is considered
 // "caught up".
@@ -154,6 +187,7 @@ func (c *Client) StreamEvents(ctx context.Context, addr string, fromIndex int64,
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
+	c.setHeaders(req)
 
 	// Use a client without the default fixed Timeout, since this is a
 	// long-lived connection; we bound it ourselves via the deadline loop
