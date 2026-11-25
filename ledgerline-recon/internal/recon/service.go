@@ -26,23 +26,39 @@ type Service struct {
 	OffsetAccount   string // recon-clearing (balancing side)
 	Logger          *log.Logger
 
-	mu       sync.Mutex
-	ledger   []Record
-	external []Record
-	breaks   []Break
+	mu         sync.Mutex
+	ledger     []Record
+	ledgerSeen map[string]bool
+	external   []Record
+	breaks     []Break
 }
 
 // NewService builds a recon service with default suspense accounts.
 func NewService(engine Engine) *Service {
-	return &Service{Engine: engine, SuspenseAccount: "recon-suspense", OffsetAccount: "recon-clearing"}
+	return &Service{Engine: engine, SuspenseAccount: "recon-suspense", OffsetAccount: "recon-clearing", ledgerSeen: make(map[string]bool)}
 }
 
-// IngestLedger sets the ledger-side records (in production read from the
-// Postgres projection / event stream).
+// IngestLedger sets the ledger-side records (manual/API feed; replaces).
 func (s *Service) IngestLedger(records []Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ledger = append(s.ledger[:0], records...)
+	s.ledgerSeen = make(map[string]bool, len(records))
+	for _, r := range records {
+		s.ledgerSeen[r.Ref] = true
+	}
+}
+
+// AddLedgerRecord appends one ledger record idempotently by Ref, for the
+// event-stream consumer (replay-safe).
+func (s *Service) AddLedgerRecord(r Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ledgerSeen[r.Ref] {
+		return
+	}
+	s.ledgerSeen[r.Ref] = true
+	s.ledger = append(s.ledger, r)
 }
 
 // IngestExternal sets the external-side records (scheme clearing file, bank

@@ -42,12 +42,20 @@ go build -o bin/recon ./cmd/recon
 ./bin/recon -http-addr 127.0.0.1:8980 -ledger-nodes 127.0.0.1:8001,...
 ```
 
+## Event-stream driven (ledger side)
+
+Recon **tails the ledger event stream** and automatically collects the
+ledger-side records from `journal_applied` / `transfer_applied` events (keyed
+by dedup id, idempotent on replay). The **external side** (scheme clearing
+files, bank statements) is ingested via `POST /v1/recon/external`. `POST
+/v1/recon/ledger` remains for manual/backfill feeding.
+
 ## Known limitations (demo-grade)
 
-- Both sides are ingested explicitly (production reads the ledger side from the
-  Postgres projection / event stream and parses real scheme/bank files).
+- The external side is ingested explicitly (production parses real scheme/bank
+  files); the ledger side now comes from the event stream.
 - Matching is by exact ref + amount; no fuzzy/amount-tolerant or many-to-one
   matching, no timing-window handling beyond flagging.
 - Only `missing_in_ledger` auto-adjusts; other break types surface for manual
   investigation.
-- In-memory record stores.
+- In-memory record stores; the consumed watermark is not persisted.

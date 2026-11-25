@@ -144,7 +144,9 @@ func (s *Service) CreatePayment(ctx context.Context, dedupID, merchantID string,
 func (s *Service) recordJournal(ctx context.Context, journalDedup string, pi *PaymentIntent) error {
 	lines := []engineclient.JournalLine{
 		{AccountID: s.ReceivableAccount, Direction: "debit", AmountMinor: pi.AmountMinor, GLAccount: "1100"},
-		{AccountID: s.PayableAccount, Direction: "credit", AmountMinor: pi.AmountMinor - pi.FeeMinor, GLAccount: "2200"},
+		// CostCenter carries the merchant so downstream clearing can net per
+		// merchant straight off the event stream.
+		{AccountID: s.PayableAccount, Direction: "credit", AmountMinor: pi.AmountMinor - pi.FeeMinor, GLAccount: "2200", CostCenter: pi.MerchantID},
 	}
 	if pi.FeeMinor > 0 {
 		lines = append(lines, engineclient.JournalLine{

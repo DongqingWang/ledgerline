@@ -30,6 +30,7 @@ type Service struct {
 
 	mu      sync.Mutex
 	pending []Capture
+	seenRef map[string]bool
 	batches []Batch
 	seq     int64
 }
@@ -40,13 +41,21 @@ func NewService(engine Engine) *Service {
 		Engine:          engine,
 		PayableAccount:  "merchant-payable",
 		SuspenseAccount: "clearing-suspense",
+		seenRef:         make(map[string]bool),
 	}
 }
 
 // Ingest accumulates a gross capture (or refund) for the next clearing run.
+// Idempotent on Ref so event-stream replay never double-counts a capture.
 func (s *Service) Ingest(c Capture) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if c.Ref != "" {
+		if s.seenRef[c.Ref] {
+			return
+		}
+		s.seenRef[c.Ref] = true
+	}
 	s.pending = append(s.pending, c)
 }
 

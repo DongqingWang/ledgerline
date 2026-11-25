@@ -44,12 +44,19 @@ go build -o bin/clearing ./cmd/clearing
 ./bin/clearing -http-addr 127.0.0.1:8880 -ledger-nodes 127.0.0.1:8001,...
 ```
 
+## Event-stream driven
+
+Clearing **tails the ledger event stream** and automatically extracts
+acquiring captures from `journal_applied` events (the merchant-payable credit
+leg carries the merchant in `cost_center`). No explicit ingest is needed —
+`POST /v1/clearing/captures` remains only for manual/backfill feeding. Ingest
+is idempotent by ref, so stream replay never double-counts.
+
 ## Known limitations (demo-grade)
 
-- Captures are ingested explicitly (production would consume the ledger event
-  stream or acquiring's captured events automatically).
 - Single `merchant-payable` / `clearing-suspense` account pair; multi-currency
   needs per-currency accounts.
-- In-memory pending captures; a clearing cycle is triggered manually, not on a
-  schedule.
+- In-memory pending captures and seen-ref set; a clearing cycle is triggered
+  manually, not on a schedule, and the consumed watermark is not persisted
+  (a restart re-consumes from index 0, deduped by ref).
 - No scheme-file-driven clearing (that is reconciliation's input, P3).
