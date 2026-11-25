@@ -152,6 +152,45 @@ func (c *Client) VoidPending(ctx context.Context, pendingID string, req ledgerty
 	return &out, nil
 }
 
+// CreateSettlement records a fat-ledger settlement intent (durable in the FSM
+// before any rail action).
+func (c *Client) CreateSettlement(ctx context.Context, req ledgertypes.CreateSettlementRequest) (*ledgertypes.Settlement, error) {
+	var out ledgertypes.Settlement
+	if err := c.writeRequest(ctx, "POST", "/v1/settlements", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// MarkSettlementProcessing marks a settlement submitted to the rail.
+func (c *Client) MarkSettlementProcessing(ctx context.Context, settlementID string, req ledgertypes.SettlementActionRequest) (*ledgertypes.Settlement, error) {
+	var out ledgertypes.Settlement
+	if err := c.writeRequest(ctx, "POST", "/v1/settlements/"+settlementID+"/mark-processing", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SettleOutcome applies a rail outcome (settled/failed) to a settlement.
+func (c *Client) SettleOutcome(ctx context.Context, settlementID string, req ledgertypes.SettlementActionRequest) (*ledgertypes.Settlement, error) {
+	var out ledgertypes.Settlement
+	if err := c.writeRequest(ctx, "POST", "/v1/settlements/"+settlementID+"/settle-outcome", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetSettlement reads a settlement entry from the first reachable node.
+func (c *Client) GetSettlement(ctx context.Context, settlementID string) (*ledgertypes.Settlement, error) {
+	var out ledgertypes.Settlement
+	for _, addr := range c.candidates() {
+		if err := c.getJSON(ctx, addr, "/v1/settlements/"+settlementID, &out); err == nil {
+			return &out, nil
+		}
+	}
+	return nil, fmt.Errorf("settlement %q: no reachable node returned it", settlementID)
+}
+
 // GetAccount reads account state from the first reachable node (not
 // necessarily the leader — see the server-side caveat about read
 // linearizability).

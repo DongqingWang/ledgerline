@@ -50,6 +50,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/pending-transfers", s.handleCreatePending)
 	mux.HandleFunc("POST /v1/pending-transfers/{id}/post", s.handlePostPending)
 	mux.HandleFunc("POST /v1/pending-transfers/{id}/void", s.handleVoidPending)
+	mux.HandleFunc("POST /v1/settlements", s.handleCreateSettlement)
+	mux.HandleFunc("GET /v1/settlements/{id}", s.handleGetSettlement)
+	mux.HandleFunc("POST /v1/settlements/{id}/mark-processing", s.handleMarkSettlementProcessing)
+	mux.HandleFunc("POST /v1/settlements/{id}/settle-outcome", s.handleSettleOutcome)
 	mux.HandleFunc("GET /v1/leader", s.handleGetLeader)
 	mux.HandleFunc("GET /v1/events/stream", s.handleEventStream)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -308,6 +312,95 @@ func (s *Server) handlePendingAction(w http.ResponseWriter, r *http.Request, cmd
 	writeJSON(w, http.StatusOK, result.Transfer)
 }
 
+func (s *Server) handleCreateSettlement(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Node.Raft.State() != raft.Leader {
+		writeError(w, http.StatusConflict, ledgertypes.ErrNotLeader, "this node is not the raft leader", s.leaderHint())
+		return
+	}
+	var req ledgertypes.CreateSettlementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, ledgertypes.ErrInvalidRequest, err.Error(), "")
+		return
+	}
+	if req.DedupID == "" || req.AccountID == "" || req.FundingAccount == "" || req.AmountMinor <= 0 || req.TimeoutSeconds <= 0 {
+		writeError(w, http.StatusBadRequest, ledgertypes.ErrInvalidRequest,
+			"dedup_id, account_id, funding_account required; amount_minor and timeout_seconds must be positive", "")
+		return
+	}
+	if !s.checkAccountsOwned(w, r, req.AccountID, req.FundingAccount) {
+		return
+	}
+	cmd := fsm.Command{Type: fsm.CmdCreateSettlement, CreateSettlement: &req}
+	result, err := s.apply(cmd)
+	if err != nil {
+		s.writeApplyError(w, err)
+		return
+	}
+	if result.IsError() {
+		writeError(w, statusForErrCode(result.ErrCode), result.ErrCode, result.ErrMsg, "")
+		return
+	}
+	writeJSON(w, http.StatusCreated, result.Settlement)
+}
+
+func (s *Server) handleGetSettlement(w http.ResponseWriter, r *http.Request) {
+	stl, ok := s.cfg.Node.FSM.Settlement(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, ledgertypes.ErrSettlementNotFound, "settlement not found", "")
+		return
+	}
+	if a, ok := s.cfg.Node.FSM.Account(stl.AccountID); ok && !s.canReadAccount(r, a) {
+		writeError(w, http.StatusNotFound, ledgertypes.ErrSettlementNotFound, "settlement not found", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, stl)
+}
+
+func (s *Server) handleMarkSettlementProcessing(w http.ResponseWriter, r *http.Request) {
+	s.handleSettlementAction(w, r, fsm.CmdMarkSettlementProcessing)
+}
+
+func (s *Server) handleSettleOutcome(w http.ResponseWriter, r *http.Request) {
+	s.handleSettlementAction(w, r, fsm.CmdSettleOutcome)
+}
+
+func (s *Server) handleSettlementAction(w http.ResponseWriter, r *http.Request, cmdType fsm.CommandType) {
+	if s.cfg.Node.Raft.State() != raft.Leader {
+		writeError(w, http.StatusConflict, ledgertypes.ErrNotLeader, "this node is not the raft leader", s.leaderHint())
+		return
+	}
+	settlementID := r.PathValue("id")
+	var req ledgertypes.SettlementActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, ledgertypes.ErrInvalidRequest, err.Error(), "")
+		return
+	}
+	if req.DedupID == "" {
+		writeError(w, http.StatusBadRequest, ledgertypes.ErrInvalidRequest, "dedup_id is required", "")
+		return
+	}
+	if cmdType == fsm.CmdSettleOutcome && req.Outcome != "settled" && req.Outcome != "failed" {
+		writeError(w, http.StatusBadRequest, ledgertypes.ErrInvalidRequest, "outcome must be settled or failed", "")
+		return
+	}
+	if stl, ok := s.cfg.Node.FSM.Settlement(settlementID); ok {
+		if !s.checkAccountsOwned(w, r, stl.AccountID, stl.FundingAccount) {
+			return
+		}
+	}
+	cmd := fsm.Command{Type: cmdType, SettlementAction: &req, SettlementID: settlementID}
+	result, err := s.apply(cmd)
+	if err != nil {
+		s.writeApplyError(w, err)
+		return
+	}
+	if result.IsError() {
+		writeError(w, statusForErrCode(result.ErrCode), result.ErrCode, result.ErrMsg, "")
+		return
+	}
+	writeJSON(w, http.StatusOK, result.Settlement)
+}
+
 // checkAccountsOwned enforces tenant isolation for non-admin callers: every
 // referenced account must belong to the caller's tenant. Missing accounts
 // pass through so the FSM reports account_not_found authoritatively. Admin
@@ -369,7 +462,7 @@ func (s *Server) writeApplyError(w http.ResponseWriter, err error) {
 
 func statusForErrCode(code ledgertypes.ErrorCode) int {
 	switch code {
-	case ledgertypes.ErrAccountNotFound, ledgertypes.ErrPendingNotFound:
+	case ledgertypes.ErrAccountNotFound, ledgertypes.ErrPendingNotFound, ledgertypes.ErrSettlementNotFound:
 		return http.StatusNotFound
 	case ledgertypes.ErrAccountExists, ledgertypes.ErrConflict, ledgertypes.ErrAlreadyReversed:
 		return http.StatusConflict

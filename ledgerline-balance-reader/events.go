@@ -44,6 +44,23 @@ type LedgerEvent struct {
 	// Holds released by deterministic expiry during this entry's
 	// application. Must be applied BEFORE the event body.
 	ExpiredPendings []ExpiredPending `json:"expired_pendings,omitempty"`
+
+	// settlement_* fields
+	SettlementID   string `json:"settlement_id,omitempty"`
+	SettlementKind string `json:"settlement_kind,omitempty"`
+	FundingAccount string `json:"funding_account,omitempty"`
+
+	// Settlements released by deterministic expiry. Applied BEFORE the body.
+	ExpiredSettlements []ExpiredSettlement `json:"expired_settlements,omitempty"`
+}
+
+// ExpiredSettlement is an in-flight settlement released by timeout.
+type ExpiredSettlement struct {
+	SettlementID string `json:"settlement_id"`
+	Kind         string `json:"kind"`
+	AccountID    string `json:"account_id"`
+	AmountMinor  int64  `json:"amount_minor"`
+	Currency     string `json:"currency"`
 }
 
 // EventJournalLine is one leg of an applied journal; it carries the
@@ -74,4 +91,9 @@ const (
 	eventKindPendingVoided    = "pending_voided"
 	eventKindCommandRejected  = "command_rejected"
 	eventKindCommandDuplicate = "command_duplicate"
+
+	eventKindSettlementCreated    = "settlement_created"
+	eventKindSettlementProcessing = "settlement_processing"
+	eventKindSettlementPosted     = "settlement_posted"
+	eventKindSettlementVoided     = "settlement_voided"
 )

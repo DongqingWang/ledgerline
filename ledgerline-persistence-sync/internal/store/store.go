@@ -224,6 +224,37 @@ func (s *Store) ApplyPendingEvent(ctx context.Context, ev events.LedgerEvent) er
 	return s.applyEvent(ctx, ev, rows)
 }
 
+// ApplySettlementEvent projects a fat-ledger settlement event. Journal legs are
+// synthesized when balance actually posts: a withdrawal at processing
+// (optimistic post), a deposit at posted. Other events only apply deltas.
+func (s *Store) ApplySettlementEvent(ctx context.Context, ev events.LedgerEvent) error {
+	var rows []translate.JournalEntryRow
+	posts := (ev.Kind == events.KindSettlementProcessing && ev.SettlementKind == "withdrawal") ||
+		(ev.Kind == events.KindSettlementPosted && ev.SettlementKind != "withdrawal")
+	if posts {
+		if ev.Currency == "" {
+			return fmt.Errorf("store: settlement %s dedup_id=%q missing currency", ev.Kind, ev.DedupID)
+		}
+		base := translate.JournalEntryRow{
+			TransferDedupID: ev.DedupID,
+			AmountMinor:     ev.AmountMinor,
+			Currency:        ev.Currency,
+			PostedAt:        ev.Timestamp,
+			RaftIndex:       ev.RaftIndex,
+		}
+		debit, credit := base, base
+		if ev.SettlementKind == "withdrawal" {
+			debit.AccountID, debit.Direction, debit.LineIndex = ev.AccountID, translate.Debit, 0
+			credit.AccountID, credit.Direction, credit.LineIndex = ev.FundingAccount, translate.Credit, 1
+		} else {
+			debit.AccountID, debit.Direction, debit.LineIndex = ev.FundingAccount, translate.Debit, 0
+			credit.AccountID, credit.Direction, credit.LineIndex = ev.AccountID, translate.Credit, 1
+		}
+		rows = []translate.JournalEntryRow{debit, credit}
+	}
+	return s.applyEvent(ctx, ev, rows)
+}
+
 // ApplyNoOp advances sync_state for events with no balance effect
 // (command_rejected / command_duplicate), still applying any expired holds
 // that rode along on the entry. Advancing the watermark for these is what

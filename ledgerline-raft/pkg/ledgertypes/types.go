@@ -152,6 +152,70 @@ type PendingActionRequest struct {
 	DedupID string `json:"dedup_id"`
 }
 
+// SettlementKind distinguishes money entering vs leaving the ledger.
+type SettlementKind string
+
+const (
+	SettlementDeposit    SettlementKind = "deposit"
+	SettlementWithdrawal SettlementKind = "withdrawal"
+)
+
+// SettlementStatus is the fat-ledger settlement lifecycle, tracked INSIDE the
+// FSM so in-flight state is raft-durable (never lost on crash):
+//
+//	pending -> processing -> posted
+//	        \-> voided      \-> voided
+//	pending/processing -> expired (deterministic sweep)
+//
+// pending/processing reserve funds for a withdrawal (PendingDebits) but only
+// record intent for a deposit; posted moves posted balance; voided/expired
+// release the reservation. A delayed return after posted is handled by the
+// ordinary Reverse primitive on the posted entry.
+type SettlementStatus string
+
+const (
+	SettlementPending    SettlementStatus = "pending"
+	SettlementProcessing SettlementStatus = "processing"
+	SettlementPosted     SettlementStatus = "posted"
+	SettlementVoided     SettlementStatus = "voided"
+	SettlementExpired    SettlementStatus = "expired"
+)
+
+// CreateSettlementRequest records a settlement intent in the ledger BEFORE any
+// external rail action, so the in-flight state is durable.
+type CreateSettlementRequest struct {
+	DedupID        string         `json:"dedup_id"`
+	Kind           SettlementKind `json:"kind"`
+	AccountID      string         `json:"account_id"`
+	FundingAccount string         `json:"funding_account"`
+	AmountMinor    int64          `json:"amount_minor"`
+	Currency       string         `json:"currency"`
+	TimeoutSeconds int64          `json:"timeout_seconds"`
+}
+
+// SettlementActionRequest marks a settlement processing (submitted to rail) or
+// applies a rail outcome. SettlementID comes from the URL path; DedupID is the
+// action's own idempotency key.
+type SettlementActionRequest struct {
+	DedupID string `json:"dedup_id"`
+	Outcome string `json:"outcome,omitempty"` // "settled" or "failed" (settle-outcome only)
+	Reason  string `json:"reason,omitempty"`
+}
+
+// Settlement is the wire view of a settlement entry.
+type Settlement struct {
+	SettlementID   string           `json:"settlement_id"`
+	DedupID        string           `json:"dedup_id"`
+	Kind           SettlementKind   `json:"kind"`
+	AccountID      string           `json:"account_id"`
+	FundingAccount string           `json:"funding_account"`
+	AmountMinor    int64            `json:"amount_minor"`
+	Currency       string           `json:"currency"`
+	Status         SettlementStatus `json:"status"`
+	ExpiresAt      time.Time        `json:"expires_at"`
+	JournalDedupID string           `json:"journal_dedup_id,omitempty"`
+}
+
 // TransferStatus is the outcome of an AssertTransfer/AssertJournal call.
 type TransferStatus string
 
@@ -186,8 +250,10 @@ const (
 	ErrAlreadyReversed ErrorCode = "already_reversed"
 	// ErrPendingNotFound: the hold does not exist (posted, voided, or expired).
 	ErrPendingNotFound ErrorCode = "pending_not_found"
-	ErrUnauthorized    ErrorCode = "unauthorized"
-	ErrForbidden       ErrorCode = "forbidden"
+	// ErrSettlementNotFound: the settlement entry does not exist.
+	ErrSettlementNotFound ErrorCode = "settlement_not_found"
+	ErrUnauthorized       ErrorCode = "unauthorized"
+	ErrForbidden          ErrorCode = "forbidden"
 )
 
 // ErrorBody is the JSON error envelope every Ledgerline HTTP service returns.
@@ -226,6 +292,11 @@ const (
 	EventPendingVoided    EventKind = "pending_voided"
 	EventCommandRejected  EventKind = "command_rejected"
 	EventCommandDuplicate EventKind = "command_duplicate"
+
+	EventSettlementCreated    EventKind = "settlement_created"
+	EventSettlementProcessing EventKind = "settlement_processing"
+	EventSettlementPosted     EventKind = "settlement_posted"
+	EventSettlementVoided     EventKind = "settlement_voided"
 )
 
 // EventJournalLine is one leg of an applied journal as emitted on the event
@@ -249,6 +320,17 @@ type ExpiredPending struct {
 	ToAccount   string `json:"to_account"`
 	AmountMinor int64  `json:"amount_minor"`
 	Currency    string `json:"currency"`
+}
+
+// ExpiredSettlement describes a settlement released by deterministic timeout
+// (rail never responded). Like ExpiredPending, it rides on the event of the
+// command whose application triggered the sweep.
+type ExpiredSettlement struct {
+	SettlementID string         `json:"settlement_id"`
+	Kind         SettlementKind `json:"kind"`
+	AccountID    string         `json:"account_id"`
+	AmountMinor  int64          `json:"amount_minor"`
+	Currency     string         `json:"currency"`
 }
 
 // LedgerEvent is one entry on the engine's committed-event stream. It is the
@@ -293,4 +375,13 @@ type LedgerEvent struct {
 	// Holds that expired during this log entry's application, if any.
 	// Consumers must release these holds before applying the event body.
 	ExpiredPendings []ExpiredPending `json:"expired_pendings,omitempty"`
+
+	// Populated for settlement events.
+	SettlementID   string         `json:"settlement_id,omitempty"`
+	SettlementKind SettlementKind `json:"settlement_kind,omitempty"`
+	FundingAccount string         `json:"funding_account,omitempty"`
+
+	// Settlements expired during this log entry's application, if any.
+	// Consumers must release these before applying the event body.
+	ExpiredSettlements []ExpiredSettlement `json:"expired_settlements,omitempty"`
 }

@@ -104,6 +104,11 @@ func main() {
 				return err
 			}
 			log.Printf("persistence-sync: applied %s raft_index=%d pending_id=%s dedup_id=%s", ev.Kind, ev.RaftIndex, ev.PendingID, ev.DedupID)
+		case events.KindSettlementCreated, events.KindSettlementProcessing, events.KindSettlementPosted, events.KindSettlementVoided:
+			if err := db.ApplySettlementEvent(ctx, ev); err != nil {
+				return err
+			}
+			log.Printf("persistence-sync: applied %s raft_index=%d settlement_id=%s kind=%s", ev.Kind, ev.RaftIndex, ev.SettlementID, ev.SettlementKind)
 		case events.KindCommandRejected, events.KindCommandDuplicate:
 			if err := db.ApplyNoOp(ctx, ev); err != nil {
 				return err

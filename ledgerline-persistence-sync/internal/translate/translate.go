@@ -209,6 +209,7 @@ func EventToAccountDeltas(ev events.LedgerEvent) ([]AccountDelta, error) {
 	for _, xp := range ev.ExpiredPendings {
 		add(xp.FromAccount, xp.Currency, 0, -xp.AmountMinor)
 	}
+	// Settlement expiries carry no balance effect (optimistic post / uncredited).
 
 	switch ev.Kind {
 	case events.KindTransferApplied:
@@ -235,6 +236,26 @@ func EventToAccountDeltas(ev events.LedgerEvent) ([]AccountDelta, error) {
 		add(ev.ToAccount, ev.Currency, ev.AmountMinor, 0)
 	case events.KindPendingVoided:
 		add(ev.FromAccount, ev.Currency, 0, -ev.AmountMinor)
+	case events.KindSettlementCreated:
+		// Intent recorded; no balance effect.
+	case events.KindSettlementProcessing:
+		// Withdrawal optimistically posted at submission; deposit nothing.
+		if ev.SettlementKind == "withdrawal" {
+			add(ev.AccountID, ev.Currency, -ev.AmountMinor, 0)
+			add(ev.FundingAccount, ev.Currency, ev.AmountMinor, 0)
+		}
+	case events.KindSettlementPosted:
+		// Withdrawal already posted (no-op); deposit credits now.
+		if ev.SettlementKind != "withdrawal" {
+			add(ev.FundingAccount, ev.Currency, -ev.AmountMinor, 0)
+			add(ev.AccountID, ev.Currency, ev.AmountMinor, 0)
+		}
+	case events.KindSettlementVoided:
+		// Withdrawal failure reverses the optimistic post; deposit no effect.
+		if ev.SettlementKind == "withdrawal" {
+			add(ev.AccountID, ev.Currency, ev.AmountMinor, 0)
+			add(ev.FundingAccount, ev.Currency, -ev.AmountMinor, 0)
+		}
 	case events.KindAccountCreated, events.KindCommandRejected, events.KindCommandDuplicate:
 		// No balance/hold effect.
 	default:

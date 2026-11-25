@@ -25,6 +25,11 @@ const (
 	KindPendingVoided    Kind = "pending_voided"
 	KindCommandRejected  Kind = "command_rejected"
 	KindCommandDuplicate Kind = "command_duplicate"
+
+	KindSettlementCreated    Kind = "settlement_created"
+	KindSettlementProcessing Kind = "settlement_processing"
+	KindSettlementPosted     Kind = "settlement_posted"
+	KindSettlementVoided     Kind = "settlement_voided"
 )
 
 // JournalLine is one leg of an applied journal as emitted on the wire. It
@@ -47,6 +52,16 @@ type ExpiredPending struct {
 	ToAccount   string `json:"to_account"`
 	AmountMinor int64  `json:"amount_minor"`
 	Currency    string `json:"currency"`
+}
+
+// ExpiredSettlement describes an in-flight settlement released by deterministic
+// timeout. Like ExpiredPending it rides on the triggering event, applied first.
+type ExpiredSettlement struct {
+	SettlementID string `json:"settlement_id"`
+	Kind         string `json:"kind"`
+	AccountID    string `json:"account_id"`
+	AmountMinor  int64  `json:"amount_minor"`
+	Currency     string `json:"currency"`
 }
 
 // LedgerEvent mirrors a single line of the ledger engine's
@@ -88,6 +103,13 @@ type LedgerEvent struct {
 	ErrMsg  string `json:"err_msg,omitempty"`
 
 	ExpiredPendings []ExpiredPending `json:"expired_pendings,omitempty"`
+
+	// settlement_* fields
+	SettlementID   string `json:"settlement_id,omitempty"`
+	SettlementKind string `json:"settlement_kind,omitempty"`
+	FundingAccount string `json:"funding_account,omitempty"`
+
+	ExpiredSettlements []ExpiredSettlement `json:"expired_settlements,omitempty"`
 }
 
 // HealthzResponse mirrors the ledger engine's GET /healthz response.

@@ -32,6 +32,10 @@ const (
 	CmdCreatePending  CommandType = "create_pending"
 	CmdPostPending    CommandType = "post_pending"
 	CmdVoidPending    CommandType = "void_pending"
+
+	CmdCreateSettlement         CommandType = "create_settlement"
+	CmdMarkSettlementProcessing CommandType = "mark_settlement_processing"
+	CmdSettleOutcome            CommandType = "settle_outcome"
 )
 
 // Command is the single envelope type serialized into every raft log entry.
@@ -54,6 +58,10 @@ type Command struct {
 	CreatePending  *ledgertypes.PendingTransferRequest `json:"create_pending,omitempty"`
 	PendingAction  *ledgertypes.PendingActionRequest   `json:"pending_action,omitempty"`
 	PendingID      string                              `json:"pending_id,omitempty"`
+
+	CreateSettlement *ledgertypes.CreateSettlementRequest `json:"create_settlement,omitempty"`
+	SettlementAction *ledgertypes.SettlementActionRequest `json:"settlement_action,omitempty"`
+	SettlementID     string                               `json:"settlement_id,omitempty"`
 }
 
 // Encode serializes a Command for raft.Raft.Apply.
@@ -65,11 +73,12 @@ func (c Command) Encode() ([]byte, error) { return json.Marshal(c) }
 // return differently across replicas based on something non-deterministic —
 // an error value here is just data, computed identically on every node.
 type ApplyResult struct {
-	Account  *ledgertypes.Account         `json:"account,omitempty"`
-	Transfer *ledgertypes.TransferResult  `json:"transfer,omitempty"`
-	Pending  *ledgertypes.PendingTransfer `json:"pending,omitempty"`
-	ErrCode  ledgertypes.ErrorCode        `json:"err_code,omitempty"`
-	ErrMsg   string                       `json:"err_msg,omitempty"`
+	Account    *ledgertypes.Account         `json:"account,omitempty"`
+	Transfer   *ledgertypes.TransferResult  `json:"transfer,omitempty"`
+	Pending    *ledgertypes.PendingTransfer `json:"pending,omitempty"`
+	Settlement *ledgertypes.Settlement      `json:"settlement,omitempty"`
+	ErrCode    ledgertypes.ErrorCode        `json:"err_code,omitempty"`
+	ErrMsg     string                       `json:"err_msg,omitempty"`
 }
 
 func (r *ApplyResult) IsError() bool { return r.ErrCode != "" }
@@ -102,6 +111,7 @@ type pending struct {
 type dedupEntry struct {
 	Result      ledgertypes.TransferResult `json:"result"`
 	Pending     *pending                   `json:"pending,omitempty"`
+	Settlement  *settlementEntry           `json:"settlement,omitempty"`
 	Fingerprint string                     `json:"fingerprint"`
 	Lines       []ledgertypes.JournalLine  `json:"lines,omitempty"`
 	Reversed    bool                       `json:"reversed,omitempty"`
@@ -111,10 +121,11 @@ type dedupEntry struct {
 // which raft guarantees is called sequentially and deterministically on
 // every replica for every committed log entry.
 type FSM struct {
-	mu       sync.RWMutex
-	accounts map[string]*account
-	pendings map[string]*pending
-	dedup    map[string]dedupEntry
+	mu          sync.RWMutex
+	accounts    map[string]*account
+	pendings    map[string]*pending
+	settlements map[string]*settlementEntry
+	dedup       map[string]dedupEntry
 	// now is the replicated logical clock: the timestamp of the most recent
 	// log entry that carried one. Hold expiry is evaluated against it, never
 	// against a replica's wall clock.
@@ -128,10 +139,11 @@ type FSM struct {
 // which is what unit tests use.
 func New(eventLogPath string) *FSM {
 	return &FSM{
-		accounts: make(map[string]*account),
-		pendings: make(map[string]*pending),
-		dedup:    make(map[string]dedupEntry),
-		events:   NewEventBus(eventLogPath),
+		accounts:    make(map[string]*account),
+		pendings:    make(map[string]*pending),
+		settlements: make(map[string]*settlementEntry),
+		dedup:       make(map[string]dedupEntry),
+		events:      NewEventBus(eventLogPath),
 	}
 }
 
@@ -223,7 +235,7 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		res := &ApplyResult{ErrCode: ledgertypes.ErrInternal, ErrMsg: fmt.Sprintf("decode command: %v", err)}
-		f.publishLocked(log.Index, rejectedEvent(res, ""), nil)
+		f.publishLocked(log.Index, rejectedEvent(res, ""), nil, nil)
 		return res
 	}
 
@@ -234,6 +246,7 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		f.now = cmd.Timestamp
 	}
 	expired := f.expirePendingsLocked(f.now)
+	expiredStl := f.expireSettlementsLocked(f.now)
 
 	res, ev := f.dispatchLocked(log.Index, cmd)
 	if ev == nil {
@@ -243,7 +256,7 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 			ev = &ledgertypes.LedgerEvent{Kind: ledgertypes.EventCommandDuplicate, DedupID: cmdDedupID(cmd)}
 		}
 	}
-	f.publishLocked(log.Index, ev, expired)
+	f.publishLocked(log.Index, ev, expired, expiredStl)
 	return res
 }
 
@@ -268,15 +281,22 @@ func cmdDedupID(cmd Command) string {
 		return cmd.CreatePending.DedupID
 	case cmd.PendingAction != nil:
 		return cmd.PendingAction.DedupID
+	case cmd.CreateSettlement != nil:
+		return cmd.CreateSettlement.DedupID
+	case cmd.SettlementAction != nil:
+		return cmd.SettlementAction.DedupID
 	}
 	return ""
 }
 
-func (f *FSM) publishLocked(index uint64, ev *ledgertypes.LedgerEvent, expired []ledgertypes.ExpiredPending) {
+func (f *FSM) publishLocked(index uint64, ev *ledgertypes.LedgerEvent, expired []ledgertypes.ExpiredPending, expiredStl []ledgertypes.ExpiredSettlement) {
 	ev.RaftIndex = index
 	ev.Timestamp = f.now
 	if len(expired) > 0 {
 		ev.ExpiredPendings = expired
+	}
+	if len(expiredStl) > 0 {
+		ev.ExpiredSettlements = expiredStl
 	}
 	f.events.Publish(*ev)
 }
@@ -318,6 +338,21 @@ func (f *FSM) dispatchLocked(index uint64, cmd Command) (*ApplyResult, *ledgerty
 			return invalidRequest("missing pending_action payload"), nil
 		}
 		return f.applyVoidPendingLocked(index, cmd)
+	case CmdCreateSettlement:
+		if cmd.CreateSettlement == nil {
+			return invalidRequest("missing create_settlement payload"), nil
+		}
+		return f.applyCreateSettlementLocked(index, cmd)
+	case CmdMarkSettlementProcessing:
+		if cmd.SettlementAction == nil {
+			return invalidRequest("missing settlement_action payload"), nil
+		}
+		return f.applyMarkSettlementProcessingLocked(index, cmd)
+	case CmdSettleOutcome:
+		if cmd.SettlementAction == nil {
+			return invalidRequest("missing settlement_action payload"), nil
+		}
+		return f.applySettleOutcomeLocked(index, cmd)
 	default:
 		return invalidRequest(fmt.Sprintf("unknown command type %q", cmd.Type)), nil
 	}
@@ -352,6 +387,16 @@ func fingerprint(cmd Command) string {
 			Action    CommandType `json:"action"`
 			PendingID string      `json:"pending_id"`
 		}{cmd.Type, cmd.PendingID}
+	case CmdCreateSettlement:
+		r := *cmd.CreateSettlement
+		r.DedupID = ""
+		payload = r
+	case CmdMarkSettlementProcessing, CmdSettleOutcome:
+		payload = struct {
+			Action       CommandType `json:"action"`
+			SettlementID string      `json:"settlement_id"`
+			Outcome      string      `json:"outcome,omitempty"`
+		}{cmd.Type, cmd.SettlementID, cmd.SettlementAction.Outcome}
 	default:
 		payload = cmd.CreateAccount
 	}
@@ -373,6 +418,10 @@ func (f *FSM) checkDedupLocked(dedupID, fp string) *ApplyResult {
 			ErrCode: ledgertypes.ErrConflict,
 			ErrMsg:  fmt.Sprintf("dedup_id %q already used with different parameters", dedupID),
 		}
+	}
+	if e.Settlement != nil {
+		cp := *e.Settlement
+		return &ApplyResult{Settlement: settlementToWire(&cp)}
 	}
 	if e.Pending != nil {
 		cp := *e.Pending
@@ -767,10 +816,11 @@ func (f *FSM) expirePendingsLocked(now time.Time) []ledgertypes.ExpiredPending {
 // --- Snapshot / Restore: periodic log compaction ---
 
 type snapshotState struct {
-	Accounts map[string]*account   `json:"accounts"`
-	Pendings map[string]*pending   `json:"pendings"`
-	Dedup    map[string]dedupEntry `json:"dedup"`
-	Now      time.Time             `json:"now"`
+	Accounts    map[string]*account         `json:"accounts"`
+	Pendings    map[string]*pending         `json:"pendings"`
+	Settlements map[string]*settlementEntry `json:"settlements"`
+	Dedup       map[string]dedupEntry       `json:"dedup"`
+	Now         time.Time                   `json:"now"`
 }
 
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -778,10 +828,11 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	defer f.mu.RUnlock()
 
 	state := snapshotState{
-		Accounts: make(map[string]*account, len(f.accounts)),
-		Pendings: make(map[string]*pending, len(f.pendings)),
-		Dedup:    make(map[string]dedupEntry, len(f.dedup)),
-		Now:      f.now,
+		Accounts:    make(map[string]*account, len(f.accounts)),
+		Pendings:    make(map[string]*pending, len(f.pendings)),
+		Settlements: make(map[string]*settlementEntry, len(f.settlements)),
+		Dedup:       make(map[string]dedupEntry, len(f.dedup)),
+		Now:         f.now,
 	}
 	for k, v := range f.accounts {
 		cp := *v
@@ -791,11 +842,19 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		cp := *v
 		state.Pendings[k] = &cp
 	}
+	for k, v := range f.settlements {
+		cp := *v
+		state.Settlements[k] = &cp
+	}
 	for k, v := range f.dedup {
 		cp := v
 		if v.Pending != nil {
 			p := *v.Pending
 			cp.Pending = &p
+		}
+		if v.Settlement != nil {
+			s := *v.Settlement
+			cp.Settlement = &s
 		}
 		if v.Lines != nil {
 			cp.Lines = make([]ledgertypes.JournalLine, len(v.Lines))
@@ -822,6 +881,10 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	f.pendings = state.Pendings
 	if f.pendings == nil {
 		f.pendings = make(map[string]*pending)
+	}
+	f.settlements = state.Settlements
+	if f.settlements == nil {
+		f.settlements = make(map[string]*settlementEntry)
 	}
 	f.dedup = state.Dedup
 	if f.dedup == nil {

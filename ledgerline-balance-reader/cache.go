@@ -64,6 +64,8 @@ func (c *BalanceCache) Apply(ev LedgerEvent) error {
 	for _, xp := range ev.ExpiredPendings {
 		c.getOrCreateLocked(xp.FromAccount, xp.Currency).PendingMinor -= xp.AmountMinor
 	}
+	// Settlement expiries carry no balance effect: a withdrawal is optimistically
+	// posted (not reserved) and a deposit was never credited, so nothing to release.
 
 	switch ev.Kind {
 	case eventKindAccountCreated:
@@ -94,6 +96,26 @@ func (c *BalanceCache) Apply(ev LedgerEvent) error {
 		to.BalanceMinor += ev.AmountMinor
 	case eventKindPendingVoided:
 		c.getOrCreateLocked(ev.FromAccount, ev.Currency).PendingMinor -= ev.AmountMinor
+	case eventKindSettlementCreated:
+		// Intent recorded; no balance effect (withdrawal posts at processing).
+	case eventKindSettlementProcessing:
+		// Withdrawal is optimistically posted at submission; deposit still nothing.
+		if ev.SettlementKind == "withdrawal" {
+			c.getOrCreateLocked(ev.AccountID, ev.Currency).BalanceMinor -= ev.AmountMinor
+			c.getOrCreateLocked(ev.FundingAccount, ev.Currency).BalanceMinor += ev.AmountMinor
+		}
+	case eventKindSettlementPosted:
+		// Withdrawal already posted at processing (no-op); deposit credits now.
+		if ev.SettlementKind != "withdrawal" {
+			c.getOrCreateLocked(ev.FundingAccount, ev.Currency).BalanceMinor -= ev.AmountMinor
+			c.getOrCreateLocked(ev.AccountID, ev.Currency).BalanceMinor += ev.AmountMinor
+		}
+	case eventKindSettlementVoided:
+		// Withdrawal failure reverses the optimistic post; deposit had no effect.
+		if ev.SettlementKind == "withdrawal" {
+			c.getOrCreateLocked(ev.AccountID, ev.Currency).BalanceMinor += ev.AmountMinor
+			c.getOrCreateLocked(ev.FundingAccount, ev.Currency).BalanceMinor -= ev.AmountMinor
+		}
 	case eventKindCommandRejected, eventKindCommandDuplicate:
 		// No balance effect; still advances the watermark so contiguity
 		// checking stays valid.
